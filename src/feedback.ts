@@ -3,12 +3,32 @@
  * @module @deepseek-ai/dsh-block-to-file
  */
 
-import type { B2FCommittedReport, B2FError, B2FFailedReport, B2FProjectionFailedReport, B2FReport, B2FStaleReport, MaterializeResult } from './types.ts'
+import type {
+  B2FCommittedReport,
+  B2FError,
+  B2FFailedReport,
+  B2FPreconditionFailedReport,
+  B2FProjectionFailedReport,
+  B2FReport,
+  B2FStaleReport,
+  B2FUnchangedReport,
+  B2FWorktreeDirtyReport,
+  MaterializeResult,
+} from './types.ts'
 
 /** Render one committed transaction. */
 export function renderSuccessFeedback(report: B2FCommittedReport): string {
-  const lines = [`[b2f] committed ${report.commit}`]
-  for (const result of report.results) {
+  return renderResults(`[b2f] committed ${report.commit}`, report.results)
+}
+
+/** Render an all-no-op transaction. */
+export function renderUnchangedFeedback(report: B2FUnchangedReport): string {
+  return renderResults(`[b2f] unchanged; no commit was created.\nrepoRevision: ${report.repoRevision}`, report.results)
+}
+
+function renderResults(prefix: string, results: readonly MaterializeResult[]): string {
+  const lines = [prefix]
+  for (const result of results) {
     lines.push(renderResultLine(result))
     if (result.diffText !== null && result.diffText.length > 0) {
       lines.push('', result.diffText)
@@ -25,15 +45,40 @@ function renderResultLine(result: MaterializeResult): string {
       return `[b2f] wrote ${result.path} (${result.lines} lines, +${result.added}/-${result.removed})`
     case 'appended':
       return `[b2f] appended ${result.path} (${result.added} lines, total ${result.lines} lines)`
+    case 'deleted':
+      return `[b2f] deleted ${result.path} (${result.removed} lines removed)`
     case 'unchanged':
-      return `[b2f] append skipped ${result.path} (already present, ${result.lines} lines)`
+      if (result.mode === 'append') return `[b2f] append skipped ${result.path} (already present, ${result.lines} lines)`
+      if (result.mode === 'delete') return `[b2f] delete skipped ${result.path} (already absent)`
+      return `[b2f] write skipped ${result.path} (content unchanged, ${result.lines} lines)`
   }
 }
 
 /** Render a validation or repository failure. */
 export function renderFailureFeedback(report: B2FFailedReport): string {
-  const prefix = `[b2f] error: ${report.errors.length} file block(s) failed; nothing was committed.`
-  const lines = report.errors.map((error, index) => {
+  return renderErrors(`[b2f] error: ${report.errors.length} file block(s) failed; nothing was committed.`, report.errors)
+}
+
+/** Render operation existence failures separately from concurrent changes. */
+export function renderPreconditionFailureFeedback(report: B2FPreconditionFailedReport): string {
+  const lines = [
+    renderErrors('[b2f] precondition failed; nothing was committed.', report.errors),
+    `repoRevision: ${report.repoRevision}`,
+  ]
+  for (const file of report.files) {
+    lines.push('', `${file.path} currentVersion: ${file.fileVersion}`)
+    if (file.content === null) {
+      lines.push('<file is absent>')
+    } else {
+      const fence = safeFence(file.content)
+      lines.push(`${fence} file=${file.path}`, file.content, fence)
+    }
+  }
+  return lines.join('\n')
+}
+
+function renderErrors(prefix: string, errors: readonly B2FError[]): string {
+  const lines = errors.map((error, index) => {
     const path = error.path === null || error.path.length === 0 ? '<missing file>' : error.path
     return `${index + 1}. \`\`\` file=${path}\n   ${error.code}: ${error.hint}`
   })
@@ -65,15 +110,43 @@ export function renderStaleFeedback(report: B2FStaleReport): string {
   return lines.join('\n')
 }
 
+/** Render local filesystem drift that would otherwise be overwritten. */
+export function renderWorktreeDirtyFeedback(report: B2FWorktreeDirtyReport): string {
+  const lines = [
+    '[b2f] worktree dirty: transaction rejected; nothing was committed.',
+    `repoRevision: ${report.repoRevision}`,
+    'Resolve, import, or discard these local changes before retrying:',
+  ]
+  for (const file of report.dirtyFiles) {
+    lines.push(
+      '',
+      file.path,
+      `expectedVersion: ${file.expectedVersion}`,
+      `targetVersion: ${file.targetVersion}`,
+      `worktreeVersion: ${file.fileVersion}`,
+    )
+    if (file.content === null) {
+      lines.push(file.fileVersion === 'absent' ? '<file is absent>' : '<path is not a regular file>')
+    } else {
+      const fence = safeFence(file.content)
+      lines.push(`${fence} file=${file.path}`, file.content, fence)
+    }
+  }
+  return lines.join('\n')
+}
+
 export function renderProjectionFailureFeedback(report: B2FProjectionFailedReport): string {
   const detail = report.errors.map(error => error.hint).join('; ')
-  return `[b2f] projection failed after canonical commit ${report.commit}; tool execution is blocked.\n${detail}`
+  return `[b2f] projection failed at canonical revision ${report.repoRevision}; tool execution is blocked.\n${detail}`
 }
 
 export function renderFeedback(report: B2FReport): string {
   switch (report.status) {
     case 'committed': return renderSuccessFeedback(report)
+    case 'unchanged': return renderUnchangedFeedback(report)
     case 'stale': return renderStaleFeedback(report)
+    case 'precondition-failed': return renderPreconditionFailureFeedback(report)
+    case 'worktree-dirty': return renderWorktreeDirtyFeedback(report)
     case 'failed': return renderFailureFeedback(report)
     case 'projection-failed': return renderProjectionFailureFeedback(report)
   }
