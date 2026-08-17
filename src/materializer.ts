@@ -2,17 +2,32 @@
  * Atomic file materializer for validated b2f blocks.
  *
  * Materialization is the only phase that touches the filesystem. Writes are
- * staged in `<root>/.b2f/tmp` and renamed over the target, so a crash never
+ * staged outside the root and renamed over the target, so a crash never
  * leaves a half-written file.
  *
  * @module @deepseek-ai/dsh-block-to-file
  */
 
-import { closeSync, existsSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, writeSync } from 'node:fs'
+import {
+  closeSync,
+  existsSync,
+  fsyncSync,
+  lstatSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  readdirSync,
+  realpathSync,
+  renameSync,
+  rmSync,
+  statSync,
+  writeSync,
+} from 'node:fs'
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { countDiffStats, unifiedDiff } from './diff.ts'
-import type { B2FError, FileBlockDiff, FileBlockNewline, MaterializeResult } from './types.ts'
+import { ERROR_HINTS } from './types.ts'
+import type { B2FError, B2FErrorCode, FileBlockDiff, FileBlockNewline, MaterializeResult } from './types.ts'
 import type { ValidatedFileBlock } from './validator.ts'
 
 /** Materializer configuration. */
@@ -28,10 +43,15 @@ export interface MaterializeOutcome {
   readonly errors: readonly B2FError[]
 }
 
+class MaterializeError extends Error {
+  constructor(readonly code: B2FErrorCode, message: string) {
+    super(message)
+  }
+}
+
 /**
  * Materialize all validated blocks in message order.
- * A failed block records `MATERIALIZE_FAILED` and stops later writes; earlier
- * writes remain on disk and are reported as written.
+ * A failed block stops later writes; earlier writes remain on disk.
  */
 export function materializeAll(
   validated: readonly ValidatedFileBlock[],
@@ -45,7 +65,7 @@ export function materializeAll(
       results.push(materializeOne(entry, config))
     } catch (error: unknown) {
       errors.push({
-        code: 'MATERIALIZE_FAILED',
+        code: error instanceof MaterializeError ? error.code : 'MATERIALIZE_FAILED',
         path: entry.block.path,
         hint: error instanceof Error ? error.message : String(error),
       })
@@ -62,21 +82,52 @@ function materializeOne(entry: ValidatedFileBlock, config: MaterializeConfig): M
   const content = convertNewlines(block.content, block.newline as FileBlockNewline)
 
   switch (block.mode) {
-    case 'create': {
+    case 'create':
+      if (previous !== undefined) throw new MaterializeError('FILE_EXISTS', ERROR_HINTS.FILE_EXISTS)
       atomicWrite(targetPath, config.root, Buffer.from(content, 'utf8'), config.tempFileKeep)
-      const lines = countLines(content)
       return {
         path: normalizedPath,
         mode: block.mode,
         status: 'created',
-        lines,
-        added: lines,
+        lines: countLines(content),
+        added: countLines(content),
         removed: 0,
         diffText: null,
       }
-    }
-    case 'append': {
-      if (previous !== undefined && previous.endsWith(content)) {
+
+    case 'update':
+      if (previous === undefined) throw new MaterializeError('FILE_NOT_FOUND', ERROR_HINTS.FILE_NOT_FOUND)
+      return replaceFile(entry, previous, content, config)
+
+    case 'write':
+      if (previous === undefined) {
+        atomicWrite(targetPath, config.root, Buffer.from(content, 'utf8'), config.tempFileKeep)
+        return {
+          path: normalizedPath,
+          mode: block.mode,
+          status: 'created',
+          lines: countLines(content),
+          added: countLines(content),
+          removed: 0,
+          diffText: renderDiff('', content, normalizedPath, block.diff as FileBlockDiff, config.diffLineLimit),
+        }
+      }
+      return replaceFile(entry, previous, content, config)
+
+    case 'append':
+      if (previous === undefined) {
+        atomicWrite(targetPath, config.root, Buffer.from(content, 'utf8'), config.tempFileKeep)
+        return {
+          path: normalizedPath,
+          mode: block.mode,
+          status: 'created',
+          lines: countLines(content),
+          added: countLines(content),
+          removed: 0,
+          diffText: null,
+        }
+      }
+      if (previous.endsWith(content)) {
         return {
           path: normalizedPath,
           mode: block.mode,
@@ -87,36 +138,75 @@ function materializeOne(entry: ValidatedFileBlock, config: MaterializeConfig): M
           diffText: null,
         }
       }
-      const merged = previous === undefined ? content : previous + content
-      atomicWrite(targetPath, config.root, Buffer.from(merged, 'utf8'), config.tempFileKeep)
+      atomicWrite(targetPath, config.root, Buffer.from(previous + content, 'utf8'), config.tempFileKeep)
       return {
         path: normalizedPath,
         mode: block.mode,
         status: 'appended',
-        lines: countLines(merged),
+        lines: countLines(previous + content),
         added: countLines(content),
         removed: 0,
         diffText: null,
       }
-    }
-    case 'write': {
-      atomicWrite(targetPath, config.root, Buffer.from(content, 'utf8'), config.tempFileKeep)
-      const oldText = previous ?? ''
-      const diffText = renderDiff(oldText, content, normalizedPath, block.diff as FileBlockDiff, config.diffLineLimit)
-      const diffLines = diffText === null ? [] : diffText.split('\n')
-      const { added, removed } = countDiffStats(diffLines)
+
+    case 'delete':
+      if (previous === undefined) {
+        return {
+          path: normalizedPath,
+          mode: block.mode,
+          status: 'unchanged',
+          lines: 0,
+          added: 0,
+          removed: 0,
+          diffText: null,
+        }
+      }
+      atomicDelete(targetPath, config.root)
       return {
         path: normalizedPath,
         mode: block.mode,
-        status: previous === undefined ? 'created' : 'updated',
-        lines: countLines(content),
-        added,
-        removed,
-        diffText,
+        status: 'deleted',
+        lines: 0,
+        added: 0,
+        removed: countLines(previous),
+        diffText: renderDiff(previous, '', normalizedPath, block.diff as FileBlockDiff, config.diffLineLimit),
       }
-    }
+
     default:
       throw new Error(`unreachable mode after validation: ${JSON.stringify(block.mode)}`)
+  }
+}
+
+function replaceFile(
+  entry: ValidatedFileBlock,
+  previous: string,
+  content: string,
+  config: MaterializeConfig,
+): MaterializeResult {
+  const { block, normalizedPath, targetPath } = entry
+  if (previous === content) {
+    return {
+      path: normalizedPath,
+      mode: block.mode as 'write' | 'update',
+      status: 'unchanged',
+      lines: countLines(content),
+      added: 0,
+      removed: 0,
+      diffText: null,
+    }
+  }
+
+  const fullDiff = unifiedDiff(previous, content, `a/${normalizedPath}`, `b/${normalizedPath}`)
+  const stats = fullDiff === null ? { added: 0, removed: 0 } : countDiffStats(fullDiff.split('\n'))
+  atomicWrite(targetPath, config.root, Buffer.from(content, 'utf8'), config.tempFileKeep)
+  return {
+    path: normalizedPath,
+    mode: block.mode as 'write' | 'update',
+    status: 'updated',
+    lines: countLines(content),
+    added: stats.added,
+    removed: stats.removed,
+    diffText: selectDiff(fullDiff, block.diff as FileBlockDiff, config.diffLineLimit),
   }
 }
 
@@ -163,11 +253,16 @@ function atomicWrite(targetPath: string, root: string, buffer: Buffer, tempFileK
     sweepTempDir(tmpDir, tempFileKeep)
   }
   try {
-    // Cleanup after a failed rename without masking the original IO error.
     rmSync(tmpPath, { force: true })
   } catch {
     // The rename may have succeeded; nothing to clean.
   }
+}
+
+function atomicDelete(targetPath: string, root: string): void {
+  assertPathInsideRoot(dirname(targetPath), root)
+  rmSync(targetPath)
+  fsyncDir(dirname(targetPath))
 }
 
 /** Best-effort directory fsync; not every platform supports syncing directories. */
@@ -210,7 +305,7 @@ function assertPathInsideRoot(targetPath: string, root: string): void {
   let current = root
   for (const segment of segments) {
     current = join(current, segment)
-    if (!existsSync(current)) return // remaining ancestors do not exist yet; mkdir creates real directories
+    if (!existsSync(current)) return
     if (lstatSync(current).isSymbolicLink()) {
       throw new Error(`block-to-file: symlink escape blocked at ${current}`)
     }
@@ -248,7 +343,6 @@ export function sweepTempDir(tmpDir: string, keep: number): void {
   }
 }
 
-/** Render a diff for `write` mode according to the block's `diff` strategy. */
 function renderDiff(
   oldText: string,
   newText: string,
@@ -256,15 +350,14 @@ function renderDiff(
   strategy: FileBlockDiff,
   diffLineLimit: number,
 ): string | null {
-  if (strategy === 'none') return null
-  const full = unifiedDiff(oldText, newText, `a/${path}`, `b/${path}`)
-  if (full === null) return null
-  if (strategy === 'stats') return null
+  return selectDiff(unifiedDiff(oldText, newText, `a/${path}`, `b/${path}`), strategy, diffLineLimit)
+}
+
+function selectDiff(full: string | null, strategy: FileBlockDiff, limit: number): string | null {
+  if (full === null || strategy === 'none' || strategy === 'stats') return null
   if (strategy === 'full') return full
-  // limited: keep the first `diffLineLimit` diff lines, then summarize.
   const lines = full.split('\n')
-  if (lines.length <= diffLineLimit) return full
-  const head = lines.slice(0, diffLineLimit).join('\n')
+  if (lines.length <= limit) return full
   const { added, removed } = countDiffStats(lines)
-  return `${head}\n[b2f] diff truncated to ${diffLineLimit} lines (+${added}/-${removed})`
+  return `${lines.slice(0, limit).join('\n')}\n[b2f] diff truncated to ${limit} lines (+${added}/-${removed})`
 }
