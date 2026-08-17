@@ -213,6 +213,7 @@
     { "path": "./packages/sandbox/sandbox-windows-acl" },
     { "path": "./packages/shell/bash-sandbox" },
     { "path": "./packages/shell/tool-bash" },
+    { "path": "./packages/fs/block-to-file" },
     { "path": "./packages/fs/fs" },
     { "path": "./packages/fs/fs-local" },
     { "path": "./packages/e2b/fs-e2b" },
