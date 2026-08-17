@@ -45,7 +45,7 @@ export class B2FService extends Service {
 
   constructor(ctx: Context, fallbackRoot: string) {
     super(ctx, 'b2f')
-    this.resolver = () => fallbackRoot
+    this.resolver = (_agent, session) => session?.header.cwd ?? fallbackRoot
   }
 
   /** Install a generic synchronous resolver for per-agent checkouts or sandboxes. */

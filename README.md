@@ -99,8 +99,9 @@ activation time:
 ctx.b2f.setRootResolver((agent, session) => checkoutRootFor(agent, session))
 ```
 
-The default resolver returns the static `config.root` / `$WS` /
-`$DSH_B2F_ROOT` fallback. b2f pins an agent's canonical snapshot when its
+The default resolver uses `session.header.cwd`, falling back to the static
+`config.root` / `$WS` / `$DSH_B2F_ROOT` value. b2f pins an agent's canonical
+snapshot when its
 repository view is first prepared and advances it only after commit or stale
 feedback. A read-capable plugin with exact path information may replace the
 snapshot fallback with `ctx.b2f.recordObservation(agentId, {...})`;

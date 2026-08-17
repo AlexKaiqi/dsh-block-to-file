@@ -193,6 +193,29 @@ describe('block-to-file plugin', () => {
     expect(readFileSync(join(root, 'crlf.txt'), 'utf8')).toBe('a\r\nb\r\n')
   })
 
+  it('uses the session cwd as the default repository root', async () => {
+    const fallback = makeRoot()
+    const sessionRoot = makeRoot()
+    const ctx = await setup(fallback)
+    const agent = makeAgent(ctx, 'b2f-plugin-session-root', sessionRoot, () => {})
+
+    agent.session.append('assistant/message', {
+      turn: 1,
+      step: 1,
+      message: {
+        id: MessageId('msg-session-root'),
+        role: 'assistant',
+        content: [textBlock('```text file=session.txt\nsession\n```\n')],
+        source: { kind: 'model', provider: 'test', model: 'test' },
+      },
+    }, { surfaceOp: 'append' })
+    await Promise.resolve()
+
+    expect(readFileSync(join(sessionRoot, 'session.txt'), 'utf8')).toBe('session\n')
+    expect(existsSync(join(fallback, 'session.txt'))).toBe(false)
+  })
+
+
   it('resolves a per-session root through ctx.b2f', async () => {
     const root = makeRoot()
     const ctx = await setup(root)
