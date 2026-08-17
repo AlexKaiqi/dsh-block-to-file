@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
@@ -52,11 +52,10 @@ describe('validateFileBlocks', () => {
     expect(result.errors.map(e => e.code)).toContain('DUPLICATE_PATH')
   })
 
-  it('rejects file exists for mode=create', () => {
+  it('leaves mode=create existence checks to the atomic transaction', () => {
     const root = makeRoot()
-    writeFileSync(join(root, 'existing.py'), 'old\n')
     const result = validate('```python file=existing.py mode=create\nnew\n```\n', root)
-    expect(result.errors.map(e => e.code)).toContain('FILE_EXISTS')
+    expect(result.valid).toBe(true)
   })
 
   it('rejects invalid mode, diff, encoding, and newline', () => {

@@ -1,4 +1,5 @@
 /* oxlint-disable typescript/no-unsafe-assignment -- Vitest asymmetric matchers are typed as any. */
+import { execFileSync } from 'node:child_process'
 import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -26,6 +27,18 @@ afterEach(async () => {
 
 function makeRoot(): string {
   const root = mkdtempSync(join(tmpdir(), 'dsh-b2f-plugin-'))
+  execFileSync('git', ['init', '--quiet'], { cwd: root })
+  execFileSync('git', ['config', 'core.hooksPath', '/dev/null'], { cwd: root })
+  execFileSync('git', ['commit', '--quiet', '--allow-empty', '-m', 'initial'], {
+    cwd: root,
+    env: {
+      ...process.env,
+      GIT_AUTHOR_NAME: 'test',
+      GIT_AUTHOR_EMAIL: 'test@example.com',
+      GIT_COMMITTER_NAME: 'test',
+      GIT_COMMITTER_EMAIL: 'test@example.com',
+    },
+  })
   roots.push(root)
   tempRoots.push(`${root}.b2f-tmp`)
   return root
@@ -156,7 +169,7 @@ describe('block-to-file plugin', () => {
     })
     expect(result.isError).toBe(true)
     expect(result.content).toEqual([
-      { type: 'text', text: expect.stringContaining('[b2f] file block validation failed') },
+      { type: 'text', text: expect.stringContaining('[b2f] file transaction failed') },
     ])
   })
 
@@ -202,6 +215,66 @@ describe('block-to-file plugin', () => {
     expect(readFileSync(join(dynamic, 'dynamic.txt'), 'utf8')).toBe('dynamic\n')
     expect(existsSync(join(root, 'dynamic.txt'))).toBe(false)
   })
+
+  it('returns stale content and treats it as the next observation', async () => {
+    const root = makeRoot()
+    const ctx = await setup(root)
+    const feedbackA: UserMessage[] = []
+    const agentA = makeAgent(ctx, 'agent-a', root, message => feedbackA.push(message))
+    const agentB = makeAgent(ctx, 'agent-b', root, () => {})
+    ctx.b2f.captureSnapshot(agentA, agentA.session, 'refs/heads/agent-canonical')
+    ctx.b2f.captureSnapshot(agentB, agentB.session, 'refs/heads/agent-canonical')
+
+    agentB.session.append('assistant/message', {
+      turn: 1,
+      step: 1,
+      message: {
+        id: MessageId('msg-winner'),
+        role: 'assistant',
+        content: [textBlock('```text file=shared.txt\nwinner\n```\n')],
+        source: { kind: 'model', provider: 'test', model: 'test' },
+      },
+    }, { surfaceOp: 'append' })
+    agentA.session.append('assistant/message', {
+      turn: 1,
+      step: 1,
+      message: {
+        id: MessageId('msg-stale'),
+        role: 'assistant',
+        content: [textBlock('```text file=shared.txt\nloser\n```\n')],
+        source: { kind: 'model', provider: 'test', model: 'test' },
+      },
+    }, { surfaceOp: 'append' })
+    await Promise.resolve()
+
+    expect(feedbackA[0]?.content).toEqual([{
+      type: 'text',
+      text: expect.stringContaining('[b2f] stale: transaction rejected'),
+    }])
+    expect(feedbackA[0]?.content).toEqual([{
+      type: 'text',
+      text: expect.stringContaining('winner'),
+    }])
+
+    agentA.session.append('assistant/message', {
+      turn: 1,
+      step: 2,
+      message: {
+        id: MessageId('msg-retry'),
+        role: 'assistant',
+        content: [textBlock('```text file=shared.txt\nretry\n```\n')],
+        source: { kind: 'model', provider: 'test', model: 'test' },
+      },
+    }, { surfaceOp: 'append' })
+    await Promise.resolve()
+
+    expect(readFileSync(join(root, 'shared.txt'), 'utf8')).toBe('retry\n')
+    expect(feedbackA[1]?.content).toEqual([{
+      type: 'text',
+      text: expect.stringContaining('[b2f] committed'),
+    }])
+  })
+
 
   it('registers the b2f model-facing prompt section', async () => {
     const root = makeRoot()

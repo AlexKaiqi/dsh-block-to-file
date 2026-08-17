@@ -2,11 +2,11 @@
 
 Model-facing **block-to-file (b2f)** runtime pipeline plugin.
 
-Fenced code blocks whose info string contains `file=` are materialized into
-`$DSH_B2F_ROOT` (configurable via `b2f.root`) before any tool call of the same
-assistant message executes. The plugin is **not a tool**: it observes
-`session/event` for `assistant/message`, validates and writes synchronously,
-then injects a `[b2f]` feedback message for the next step.
+Fenced code blocks whose info string contains `file=` are committed into the
+Git repository at `$DSH_B2F_ROOT` before any tool call of the same assistant
+message executes. The plugin is **not a tool**: it observes `assistant/message`,
+validates every block, compares the target blobs with the agent's repository
+snapshot, and publishes all files as one commit with `git update-ref` CAS.
 
 ## Protocol
 
@@ -21,12 +21,16 @@ Attributes: `file` (required), `mode=write|create|append` (default `write`),
 `diff=full|limited|stats|none` (default `limited`), `encoding=utf-8`,
 `newline=preserve|lf|crlf`.
 
-`append` is idempotent per message: when the target already ends with the
-block content, b2f reports `[b2f] append skipped` instead of duplicating.
+`append` is computed from the observed blob and is idempotent: when that blob
+already ends with the block content, b2f reports `[b2f] append skipped`.
 
-Atomic-write temp files live in `<root>.b2f-tmp` (or `$DSH_B2F_TMP`), never
-inside the root itself, so the working tree stays clean for consumers that
-allow-list its entries.
+All blocks in one assistant message are one transaction. If any target blob is
+stale, nothing commits and feedback includes each stale file's latest complete
+content, blob OID, repository revision, and intervening b2f commits. A stale
+response becomes the agent's new observation for an immediate retry.
+
+Git index construction and workspace-projection temp files live in
+`<root>.b2f-tmp` (or `$DSH_B2F_TMP`), outside the worktree.
 
 ## Configuration
 
@@ -37,9 +41,15 @@ b2f:
   maxTotalSize: 2097152
   maxFilesPerMessage: 16
   diffLineLimit: 200
-  gitStatusFeedback: true
+  canonicalRef: refs/heads/agent-canonical
+  maxCasRetries: 8
   tempFileKeep: 16
 ```
+
+`root` must be a Git worktree root with a valid `HEAD` commit. On first use b2f
+creates `canonicalRef` from `HEAD`; after that the canonical ref is the only
+publication source of truth. Unrelated concurrent commits are retained when b2f
+rebuilds its candidate on the latest canonical head.
 
 ## Environment
 
@@ -82,18 +92,19 @@ b2f replaces the model-facing `str_replace_editor` write path. Remove or
 disable the official editor in YOUR composition (preset / overlay) — this
 package intentionally does not patch or remove any official plugin.
 
-For dynamic working copies, install a root resolver at activation time:
+For generic per-agent checkouts or sandboxes, install a root resolver at
+activation time:
 
 ```ts
-ctx.b2f.setRootResolver((agent, session) => {
-  // e.g. WorkSurface: child agent -> its checkout workingPath,
-  // parent agent -> the attempt workspace. Never return a canonical store.
-  return workingPathFor(agent, session)
-})
+ctx.b2f.setRootResolver((agent, session) => checkoutRootFor(agent, session))
 ```
 
 The default resolver returns the static `config.root` / `$WS` /
-`$DSH_B2F_ROOT` fallback.
+`$DSH_B2F_ROOT` fallback. b2f pins an agent's canonical snapshot when its
+repository view is first prepared and advances it only after commit or stale
+feedback. A read-capable plugin with exact path information may replace the
+snapshot fallback with `ctx.b2f.recordObservation(agentId, {...})`;
+b2f itself has no dependency on that plugin.
 
 ```yaml
 # in your preset or overlay cordis.yml

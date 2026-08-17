@@ -1,17 +1,15 @@
 /**
  * block-to-file (b2f) runtime pipeline plugin.
  *
- * b2f materializes fenced code blocks whose info string carries a `file=`
- * attribute into the workspace BEFORE any tool call of the same assistant
- * message executes. It is not a tool: it listens to `session/event` for
- * `assistant/message`, validates and writes files synchronously, injects a
- * `[b2f]` feedback message for the next step, and denies tool execution when
- * validation failed.
+ * b2f commits fenced code blocks whose info string carries a `file=`
+ * attribute BEFORE any tool call of the same assistant message executes. It
+ * is not a tool: it validates all blocks, compares their observed Git blobs,
+ * publishes one commit with ref CAS, injects `[b2f]` feedback, and denies tool
+ * execution unless the whole transaction committed.
  *
  * @module @deepseek-ai/dsh-block-to-file
  */
 
-import { execFileSync } from 'node:child_process'
 import { isAbsolute, resolve } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
@@ -21,7 +19,7 @@ import type { Session, SessionEvent } from '@deepseek-ai/dsh-session'
 import type { PreToolDecision, ToolExecution } from '@deepseek-ai/dsh-tools'
 import { parseFileBlocks as parseBlocks } from './parser.ts'
 import { validateFileBlocks as validateBlocks } from './validator.ts'
-import { assertTempDirOutsideRoot as assertTmpOutside, materializeAll as materialize, resolveTempDir, sweepTempDir } from './materializer.ts'
+import { assertTempDirOutsideRoot as assertTmpOutside, resolveTempDir, sweepTempDir } from './materializer.ts'
 import { renderFeedback as renderB2FFeedback } from './feedback.ts'
 import { DEFAULT_PROMPT } from './prompt.ts'
 import { B2FService as B2FServiceClass } from './service.ts'
@@ -31,14 +29,15 @@ export { parseFileBlocks } from './parser.ts'
 export type { ParseResult } from './parser.ts'
 export { validateFileBlocks } from './validator.ts'
 export type { B2FValidationConfig, ValidatedFileBlock, ValidationResult } from './validator.ts'
-export { assertTempDirOutsideRoot, materializeAll, resolveTempDir, sweepTempDir } from './materializer.ts'
-export type { MaterializeConfig, MaterializeOutcome } from './materializer.ts'
-export { renderFailureFeedback, renderFeedback, renderSuccessFeedback } from './feedback.ts'
+export { assertTempDirOutsideRoot, resolveTempDir, sweepTempDir } from './materializer.ts'
+export { commitFileBlocks, fileVersionAt, projectRevision, resolveCanonicalRevision, resolveWorktreeRevision } from './transaction.ts'
+export type { ObservedFileProposal, TransactionConfig } from './transaction.ts'
+export { renderFailureFeedback, renderFeedback, renderProjectionFailureFeedback, renderStaleFeedback, renderSuccessFeedback } from './feedback.ts'
 export { countDiffStats, unifiedDiff } from './diff.ts'
 export type { DiffHunk } from './diff.ts'
 export { B2FService } from './service.ts'
-export type { B2FRootResolver } from './service.ts'
-export type { B2FError, B2FErrorCode, B2FReport, FileBlock, FileBlockDiff, FileBlockEncoding, FileBlockMode, FileBlockNewline, MaterializeResult, MaterializeStatus, StepB2FState } from './types.ts'
+export type { B2FCommitConfig, B2FRootResolver } from './service.ts'
+export type { B2FCommittedReport, B2FError, B2FErrorCode, B2FFailedReport, B2FProjectionFailedReport, B2FReport, B2FStaleReport, ChangeSinceRead, FileBlock, FileBlockDiff, FileBlockEncoding, FileBlockMode, FileBlockNewline, FileObservation, FileVersion, MaterializeResult, MaterializeStatus, StaleFile, StepB2FState } from './types.ts'
 
 export const name = 'block-to-file'
 export const inject = ['systemPrompt', 'tools', 'agents']
@@ -53,7 +52,10 @@ export interface Config {
   maxTotalSize: number
   maxFilesPerMessage: number
   diffLineLimit: number
-  gitStatusFeedback: boolean
+  /** Canonical Git ref published with compare-and-swap. */
+  canonicalRef: string
+  /** Maximum retries when unrelated concurrent commits win the ref CAS. */
+  maxCasRetries: number
   tempFileKeep: number
   newline: 'preserve' | 'lf' | 'crlf'
   prompt: string
@@ -67,8 +69,9 @@ export const Config: z<Config> = z.object({
   maxTotalSize: z.number().default(2_097_152),
   maxFilesPerMessage: z.number().default(16),
   diffLineLimit: z.number().default(200),
+  canonicalRef: z.string().default('refs/heads/agent-canonical'),
+  maxCasRetries: z.number().default(8),
   tempFileKeep: z.number().default(16),
-  gitStatusFeedback: z.boolean().default(true),
   newline: z.union(['preserve', 'lf', 'crlf'] as const).default('preserve'),
   prompt: z.string().default(DEFAULT_PROMPT),
 })
@@ -80,7 +83,8 @@ interface ResolvedConfig {
   readonly maxTotalSize: number
   readonly maxFilesPerMessage: number
   readonly diffLineLimit: number
-  readonly gitStatusFeedback: boolean
+  readonly canonicalRef: string
+  readonly maxCasRetries: number
   readonly tempFileKeep: number
   readonly newline: 'preserve' | 'lf' | 'crlf'
   readonly prompt: string
@@ -106,8 +110,13 @@ export function apply(ctx: Context, config: Config): void {
     text: resolved.prompt,
   })
 
-  // Phase 1-3: parse, validate, and materialize synchronously inside the
-  // `assistant/message` append so every file exists before tool execution.
+  // Capture the immutable repository view on which the next model decision is based.
+  ctx.on('agent/pre-step', async (payload, next) => {
+    ctx.b2f.captureSnapshot(payload.agent, payload.agent.session, resolved.canonicalRef, resolved.tempFileKeep)
+    return next()
+  })
+
+  // Parse, validate, compare, and publish synchronously before same-message tools.
   ctx.on('session/event', (session: Session, event: SessionEvent) => {
     if (event.type === 'step/end') {
       state.delete(stateKey(session.id, event.data.turn, event.data.step))
@@ -117,53 +126,57 @@ export function apply(ctx: Context, config: Config): void {
 
     const agent = ctx.agents.get(session.id)
     if (agent === undefined) return
-
-    const root = ctx.b2f.resolveRoot(agent, session)
-    const report = runPipeline(event.data.message.content, resolved, root)
+    const report = runPipeline(event.data.message.content, resolved, agent, session, ctx.b2f)
+    if (report === null) return
     const feedback = renderB2FFeedback(report)
     const key = stateKey(session.id, event.data.turn, event.data.step)
     state.set(key, { turn: event.data.turn, step: event.data.step, report, feedback })
 
-    if (feedback.length === 0) return
     queueMicrotask(() => {
       injectFeedback(agent, feedback)
     })
   })
 
-  // Phase gate: never let a tool call run when this step's file blocks failed
-  // validation (they were not materialized).
+  // A tool may observe proposed files only after their whole transaction commits.
   ctx.on('tools/pre-execute', async (exec: ToolExecution, next: () => Promise<PreToolDecision>): Promise<PreToolDecision> => {
     const agent = exec.agent
     if (agent === undefined) return next()
     const current = currentAssistant(agent)
     if (current === undefined) return next()
     const stepState = state.get(stateKey(agent.id, current.turn, current.step))
-    if (stepState !== undefined && !stepState.report.ok && stepState.report.results.length === 0) {
+    if (stepState !== undefined && stepState.report.status !== 'committed') {
       return {
         kind: 'deny',
-        reason: '[b2f] file block validation failed; see the [b2f] error feedback for fixes.',
+        reason: `[b2f] file transaction ${stepState.report.status}; see the [b2f] feedback before retrying.`,
       }
     }
     return next()
   })
 }
 
-/** Run parse → validate → materialize for one assistant message. */
-function runPipeline(content: readonly ContentBlock[], config: ResolvedConfig, root: string): B2FReport {
+/** Run parse → validate → compare-and-commit for one assistant message. */
+function runPipeline(
+  content: readonly ContentBlock[],
+  config: ResolvedConfig,
+  agent: Agent,
+  session: Session,
+  service: B2FServiceClass,
+): B2FReport | null {
   const text = content
     .filter((block): block is Extract<ContentBlock, { type: 'text' }> => block.type === 'text')
     .map(block => block.text)
     .join('')
 
   const parsed = parseBlocks(text, config.newline)
+  if (parsed.blocks.length === 0 && parsed.errors.length === 0) return null
   if (!isWellFormedUtf16(text)) {
-    return {
-      ok: false,
-      results: [],
-      errors: [{ code: 'ENCODING_INVALID', path: null, hint: 'emit valid UTF-8 text only (no unpaired surrogate code points)' }],
-      gitStatus: null,
-    }
+    return failedReport([{
+      code: 'ENCODING_INVALID',
+      path: null,
+      hint: 'emit valid UTF-8 text only (no unpaired surrogate code points)',
+    }])
   }
+  const root = service.resolveRoot(agent, session)
   const validation = validateBlocks(parsed.blocks, {
     root,
     maxFileSize: config.maxFileSize,
@@ -172,24 +185,25 @@ function runPipeline(content: readonly ContentBlock[], config: ResolvedConfig, r
   })
 
   const errors: B2FError[] = [...parsed.errors, ...validation.errors]
-  if (errors.length > 0) {
-    return { ok: false, results: [], errors, gitStatus: null }
-  }
+  if (errors.length > 0) return failedReport(errors)
 
-  const outcome = materialize(validation.validated, {
-    root,
+  return service.commit(agent, session, validation.validated, {
+    canonicalRef: config.canonicalRef,
     diffLineLimit: config.diffLineLimit,
     tempFileKeep: config.tempFileKeep,
+    maxCasRetries: config.maxCasRetries,
   })
-  if (outcome.errors.length > 0) {
-    return { ok: false, results: outcome.results, errors: outcome.errors, gitStatus: null }
-  }
+}
 
+function failedReport(errors: readonly B2FError[]): B2FReport {
   return {
-    ok: true,
-    results: outcome.results,
-    errors: [],
-    gitStatus: config.gitStatusFeedback ? readGitStatus(root) : null,
+    status: 'failed',
+    ok: false,
+    commit: null,
+    repoRevision: null,
+    results: [],
+    errors,
+    staleFiles: [],
   }
 }
 
@@ -203,7 +217,8 @@ function resolveConfig(config: Config): ResolvedConfig {
       maxTotalSize: config.maxTotalSize,
       maxFilesPerMessage: config.maxFilesPerMessage,
       diffLineLimit: config.diffLineLimit,
-      gitStatusFeedback: config.gitStatusFeedback,
+      canonicalRef: config.canonicalRef,
+      maxCasRetries: config.maxCasRetries,
       tempFileKeep: config.tempFileKeep,
       newline: config.newline,
       prompt: config.prompt,
@@ -225,7 +240,8 @@ function resolveConfig(config: Config): ResolvedConfig {
     maxTotalSize: config.maxTotalSize,
     maxFilesPerMessage: config.maxFilesPerMessage,
     diffLineLimit: config.diffLineLimit,
-    gitStatusFeedback: config.gitStatusFeedback,
+    canonicalRef: config.canonicalRef,
+    maxCasRetries: config.maxCasRetries,
     tempFileKeep: config.tempFileKeep,
     newline: config.newline,
     prompt: config.prompt,
@@ -239,6 +255,7 @@ function assertValidLimits(config: Config): void {
     ['maxTotalSize', config.maxTotalSize],
     ['maxFilesPerMessage', config.maxFilesPerMessage],
     ['diffLineLimit', config.diffLineLimit],
+    ['maxCasRetries', config.maxCasRetries],
     ['tempFileKeep', config.tempFileKeep],
   ]
   for (const [field, value] of positiveIntegers) {
@@ -248,6 +265,9 @@ function assertValidLimits(config: Config): void {
   }
   if (config.maxTotalSize < config.maxFileSize) {
     throw new Error(`block-to-file: maxTotalSize (${config.maxTotalSize}) must be >= maxFileSize (${config.maxFileSize})`)
+  }
+  if (!config.canonicalRef.startsWith('refs/')) {
+    throw new Error(`block-to-file: canonicalRef must be a fully qualified refs/... name (got ${JSON.stringify(config.canonicalRef)})`)
   }
   if (config.prompt.trim().length === 0) {
     throw new Error('block-to-file: prompt must be non-empty')
@@ -290,20 +310,5 @@ function injectFeedback(agent: Agent, feedback: string): void {
   } catch (error: unknown) {
     // Injection failures are contained: file materialization already happened.
     void error
-  }
-}
-
-/** Best-effort `git status --short` snapshot; no git repository yields null. */
-function readGitStatus(root: string): string | null {
-  try {
-    const output = execFileSync('git', ['status', '--short'], {
-      cwd: root,
-      encoding: 'utf8',
-      stdio: ['ignore', 'pipe', 'ignore'],
-    })
-    const text = output.trim()
-    return text.length > 0 ? text : null
-  } catch {
-    return null
   }
 }

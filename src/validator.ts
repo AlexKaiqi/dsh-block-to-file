@@ -5,7 +5,6 @@
  * @module @deepseek-ai/dsh-block-to-file
  */
 
-import { existsSync } from 'node:fs'
 import { posix } from 'node:path'
 import { ERROR_HINTS, type B2FError, type FileBlock } from './types.ts'
 
@@ -120,14 +119,6 @@ export function validateFileBlocks(
         hint: `${ERROR_HINTS.SIZE_EXCEEDED} (${byteLength} bytes, limit ${config.maxFileSize})`,
       })
     }
-    if (block.mode === 'create' && existsSync(targetPath)) {
-      errors.push({
-        code: 'FILE_EXISTS',
-        path: block.path,
-        hint: ERROR_HINTS.FILE_EXISTS,
-      })
-    }
-
     validated.push({ block, normalizedPath, targetPath, byteLength })
   }
 

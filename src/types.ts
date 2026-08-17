@@ -35,13 +35,22 @@ export interface FileBlock {
   readonly index: number
 }
 
+/** Git blob identity observed by an agent; `absent` is versioned non-existence. */
+export type FileVersion = string | 'absent'
+
+/** One explicit observation supplied by a read-capable runtime plugin. */
+export interface FileObservation {
+  readonly path: string
+  readonly fileVersion: FileVersion
+  readonly repoRevision: string
+}
+
 /** Stable machine-routing error codes, one entry per failed block. */
 export type B2FErrorCode =
   | 'PATH_REQUIRED'
   | 'PATH_ABSOLUTE'
   | 'PATH_ESCAPE'
   | 'DUPLICATE_PATH'
-  | 'FILE_EXISTS'
   | 'SIZE_EXCEEDED'
   | 'TOTAL_SIZE_EXCEEDED'
   | 'TOO_MANY_FILES'
@@ -76,14 +85,69 @@ export interface MaterializeResult {
   readonly diffText: string | null
 }
 
-/** Full outcome of one assistant message's b2f pipeline run. */
-export interface B2FReport {
-  readonly ok: boolean
+/** Commit metadata explaining one canonical change since an observation. */
+export interface ChangeSinceRead {
+  readonly commit: string
+  readonly agent: string | null
+  readonly message: string
+}
+
+/** Latest canonical state returned for one stale transaction path. */
+export interface StaleFile {
+  readonly path: string
+  readonly content: string | null
+  readonly fileVersion: FileVersion
+  readonly observedVersion: FileVersion
+  readonly repoRevision: string
+  readonly changesSinceRead: readonly ChangeSinceRead[]
+}
+
+/** A whole assistant message was committed as one Git transaction. */
+export interface B2FCommittedReport {
+  readonly status: 'committed'
+  readonly ok: true
+  readonly commit: string
+  readonly repoRevision: string
+  readonly results: readonly MaterializeResult[]
+  readonly errors: readonly []
+  readonly staleFiles: readonly []
+}
+
+/** No proposal was committed because at least one target path was stale. */
+export interface B2FStaleReport {
+  readonly status: 'stale'
+  readonly ok: false
+  readonly commit: null
+  readonly repoRevision: string
+  readonly results: readonly []
+  readonly errors: readonly []
+  readonly staleFiles: readonly StaleFile[]
+}
+
+/** Parsing, validation, or pre-publication repository failure. */
+export interface B2FFailedReport {
+  readonly status: 'failed'
+  readonly ok: false
+  readonly commit: null
+  readonly repoRevision: string | null
+  readonly results: readonly []
+  readonly errors: readonly B2FError[]
+  readonly staleFiles: readonly []
+}
+
+/** Canonical publication succeeded but the local worktree could not catch up. */
+export interface B2FProjectionFailedReport {
+  readonly status: 'projection-failed'
+  readonly ok: false
+  readonly commit: string
+  readonly repoRevision: string
   readonly results: readonly MaterializeResult[]
   readonly errors: readonly B2FError[]
-  /** Optional `git status --short` snapshot for feedback. */
-  readonly gitStatus: string | null
+  readonly staleFiles: readonly []
 }
+
+/** Full transactional outcome of one assistant message's b2f pipeline run. */
+export type B2FReport = B2FCommittedReport | B2FStaleReport | B2FFailedReport | B2FProjectionFailedReport
 
 /** Per-step pipeline state retained between session/event and tools/pre-execute. */
 export interface StepB2FState {
@@ -99,7 +163,6 @@ export const ERROR_HINTS: Record<B2FErrorCode, string> = {
   PATH_ABSOLUTE: 'use a path relative to $DSH_B2F_ROOT, e.g. file=src/app.py',
   PATH_ESCAPE: 'use a relative path inside $DSH_B2F_ROOT; `.` and `..` path segments are rejected',
   DUPLICATE_PATH: 'merge every block targeting this path into one file block in this message',
-  FILE_EXISTS: 'use mode=write to overwrite the existing file, or choose a different path',
   SIZE_EXCEEDED: 'split the file into smaller files or reduce its content',
   TOTAL_SIZE_EXCEEDED: 'split the content across multiple assistant messages',
   TOO_MANY_FILES: 'split the file blocks across multiple assistant messages',

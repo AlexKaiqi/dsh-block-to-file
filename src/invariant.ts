@@ -15,9 +15,9 @@ export const name = 'block-to-file-invariant'
 export const inject = ['invariants']
 
 /**
- * No durable-shape invariant: b2f materializes files on the filesystem rather
- * than owning independent session-log state. Filesystem policy relations stay
- * with the fs and sandbox provider plugins.
+ * No session-log invariant: b2f's durable state is a linear canonical Git ref
+ * whose parent relation and compare-and-swap publication are enforced by the
+ * plugin's transaction implementation.
  * @param _ctx - registrant context (unused; kept for the Cordis plugin face).
  * @returns an empty installer reservation for package ownership.
  */

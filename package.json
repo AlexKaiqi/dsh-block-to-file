@@ -1,6 +1,6 @@
 {
   "name": "@deepseek-ai/dsh-block-to-file",
-  "description": "block-to-file (b2f) runtime pipeline plugin: materializes fenced file blocks into the workspace before tool execution, with validation, atomic writes, and automatic diff feedback",
+  "description": "block-to-file runtime plugin: atomically commits fenced file blocks with Git blob observations, multi-file transactions, and ref CAS",
   "version": "0.1.0-rc.6",
   "license": "MIT",
   "type": "module",
