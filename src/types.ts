@@ -239,4 +239,3 @@ export const ERROR_HINTS: Record<B2FErrorCode, string> = {
   FILE_NOT_FOUND: 'mode=update requires an existing file; use mode=create or mode=write after checking the path',
   MATERIALIZE_FAILED: 'retry the operation, or check repository state, disk space, and permissions',
 }
-```等待本次 b2f 提交反馈后继续，避免异步消息再次混入文件内容。
