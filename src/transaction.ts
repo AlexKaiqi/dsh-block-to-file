@@ -1,11 +1,40 @@
 import { execFileSync } from 'node:child_process'
-import { chmodSync, closeSync, existsSync, fsyncSync, lstatSync, mkdirSync, openSync, realpathSync, renameSync, rmSync, symlinkSync, writeSync } from 'node:fs'
+import {
+  chmodSync,
+  closeSync,
+  existsSync,
+  fsyncSync,
+  lstatSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  readlinkSync,
+  realpathSync,
+  renameSync,
+  rmSync,
+  symlinkSync,
+  writeSync,
+} from 'node:fs'
 import { dirname, isAbsolute, join, relative, sep } from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { countDiffStats, unifiedDiff } from './diff.ts'
 import { resolveTempDir, sweepTempDir } from './materializer.ts'
+import { ERROR_HINTS } from './types.ts'
 import type { ValidatedFileBlock } from './validator.ts'
-import type { B2FReport, ChangeSinceRead, FileBlockDiff, FileBlockMode, FileBlockNewline, FileObservation, FileVersion, MaterializeResult, StaleFile } from './types.ts'
+import type {
+  B2FError,
+  B2FReport,
+  ChangeSinceRead,
+  DirtyFile,
+  FileBlockDiff,
+  FileBlockMode,
+  FileBlockNewline,
+  FileObservation,
+  FileVersion,
+  MaterializeResult,
+  PreconditionFile,
+  StaleFile,
+} from './types.ts'
 
 /** One validated proposal paired with the version on which it is based. */
 export interface ObservedFileProposal {
@@ -30,13 +59,19 @@ interface Candidate {
   readonly mode: FileBlockMode
   readonly expectedVersion: FileVersion
   readonly observedRevision: string
-  readonly content: string
+  readonly content: string | null
+  readonly preconditionError: B2FError | null
   readonly result: MaterializeResult
 }
 
 interface TreeEntry {
   readonly mode: string
   readonly version: FileVersion
+}
+
+interface WorktreeEntry {
+  readonly version: FileVersion | 'non-file'
+  readonly content: string | null
 }
 
 /** Resolve the current canonical commit, initializing the ref from HEAD once. */
@@ -72,6 +107,13 @@ export function commitFileBlocks(
       const head = resolveCanonicalRevision(config.root, config.canonicalRef)
       const staleFiles = findStaleFiles(candidates, head, config.root)
       if (staleFiles.length > 0) {
+        const dirtyFiles = findWorktreeDirty(
+          config.root,
+          config.viewRevision,
+          head,
+          candidates.map(candidate => candidate.path),
+        )
+        if (dirtyFiles.length > 0) return worktreeDirtyReport(head, dirtyFiles)
         projectRevision(config.root, config.viewRevision, head, config.tempFileKeep)
         return {
           status: 'stale',
@@ -84,26 +126,67 @@ export function commitFileBlocks(
         }
       }
 
+      const preconditionErrors = candidates
+        .map(candidate => candidate.preconditionError)
+        .filter((error): error is B2FError => error !== null)
+      if (preconditionErrors.length > 0) {
+        const files: PreconditionFile[] = preconditionErrors.map(error => {
+          const path = error.path!
+          const version = fileVersionAt(config.root, head, path)
+          return {
+            path,
+            content: version === 'absent' ? null : readBlob(config.root, version),
+            fileVersion: version,
+          }
+        })
+        return {
+          status: 'precondition-failed',
+          ok: false,
+          commit: null,
+          repoRevision: head,
+          results: [],
+          errors: preconditionErrors,
+          staleFiles: [],
+          files,
+        }
+      }
+
       const tree = buildTree(config.root, head, candidates)
-      const commit = createCommit(config.root, tree, head, config.agentId, candidates.map(candidate => candidate.path))
+      const dirtyFiles = findWorktreeDirty(
+        config.root,
+        config.viewRevision,
+        tree,
+        candidates.map(candidate => candidate.path),
+      )
+      if (dirtyFiles.length > 0) return worktreeDirtyReport(head, dirtyFiles)
+
+      if (tree === treeForRevision(config.root, head)) {
+        try {
+          projectRevision(config.root, config.viewRevision, head, config.tempFileKeep)
+        } catch (error: unknown) {
+          return projectionFailedReport(head, candidates, error)
+        }
+        return {
+          status: 'unchanged',
+          ok: true,
+          commit: null,
+          repoRevision: head,
+          results: candidates.map(candidate => candidate.result),
+          errors: [],
+          staleFiles: [],
+        }
+      }
+
+      const changedPaths = candidates
+        .filter(candidate => candidate.result.status !== 'unchanged')
+        .map(candidate => candidate.path)
+      const commit = createCommit(config.root, tree, head, config.agentId, changedPaths)
       if (!updateRef(config.root, config.canonicalRef, commit, head)) continue
 
       try {
         projectRevision(config.root, config.viewRevision, commit, config.tempFileKeep)
       } catch (error: unknown) {
-        return {
-          status: 'projection-failed',
-          ok: false,
-          commit,
-          repoRevision: commit,
-          results: candidates.map(candidate => candidate.result),
-          errors: [{
-            code: 'MATERIALIZE_FAILED',
-            path: null,
-            hint: error instanceof Error ? error.message : String(error),
-          }],
-          staleFiles: [],
-        }
+        return projectionFailedReport(commit, candidates, error)
       }
       return {
         status: 'committed',
@@ -133,23 +216,99 @@ export function commitFileBlocks(
   }
 }
 
+function projectionFailedReport(
+  revision: string,
+  candidates: readonly Candidate[],
+  error: unknown,
+): B2FReport {
+  return {
+    status: 'projection-failed',
+    ok: false,
+    commit: revision,
+    repoRevision: revision,
+    results: candidates.map(candidate => candidate.result),
+    errors: [{
+      code: 'MATERIALIZE_FAILED',
+      path: null,
+      hint: error instanceof Error ? error.message : String(error),
+    }],
+    staleFiles: [],
+  }
+}
+
+function worktreeDirtyReport(repoRevision: string, dirtyFiles: readonly DirtyFile[]): B2FReport {
+  return {
+    status: 'worktree-dirty',
+    ok: false,
+    commit: null,
+    repoRevision,
+    results: [],
+    errors: [],
+    staleFiles: [],
+    dirtyFiles,
+  }
+}
+
 function buildCandidate(proposal: ObservedFileProposal, config: TransactionConfig): Candidate {
   const { block, normalizedPath } = proposal.entry
   const mode = block.mode as FileBlockMode
-  const expectedVersion = mode === 'create' ? 'absent' : proposal.observation.fileVersion
+  const expectedVersion = proposal.observation.fileVersion
   const previous = readObservedContent(config.root, expectedVersion)
   const proposed = convertNewlines(block.content, block.newline as FileBlockNewline)
-  const appended = mode === 'append' ? previous + proposed : proposed
-  const unchanged = mode === 'append' && previous.endsWith(proposed)
-  const content = unchanged ? previous : appended
-  const status = mode === 'append'
-    ? unchanged ? 'unchanged' : 'appended'
-    : expectedVersion === 'absent' ? 'created' : 'updated'
-  const diffText = mode === 'write'
-    ? renderDiff(previous, content, normalizedPath, block.diff as FileBlockDiff, config.diffLineLimit)
-    : null
-  const diffLines = diffText === null ? [] : diffText.split('\n')
-  const stats = countDiffStats(diffLines)
+
+  let content: string | null
+  let status: MaterializeResult['status']
+  let added = 0
+  let removed = 0
+  let rawDiff: string | null = null
+
+  switch (mode) {
+    case 'write':
+    case 'create':
+    case 'update': {
+      content = proposed
+      status = expectedVersion === 'absent'
+        ? 'created'
+        : previous === proposed ? 'unchanged' : 'updated'
+      rawDiff = mode === 'create' ? null : unifiedDiff(previous, content, `a/${normalizedPath}`, `b/${normalizedPath}`)
+      const stats = rawDiff === null ? { added: 0, removed: 0 } : countDiffStats(rawDiff.split('\n'))
+      added = expectedVersion === 'absent' ? countLines(content) : stats.added
+      removed = stats.removed
+      break
+    }
+    case 'append': {
+      if (expectedVersion === 'absent') {
+        content = proposed
+        status = 'created'
+        added = countLines(proposed)
+      } else if (previous.endsWith(proposed)) {
+        content = previous
+        status = 'unchanged'
+      } else {
+        content = previous + proposed
+        status = 'appended'
+        added = countLines(proposed)
+      }
+      break
+    }
+    case 'delete': {
+      content = null
+      if (expectedVersion === 'absent') {
+        status = 'unchanged'
+      } else {
+        status = 'deleted'
+        removed = countLines(previous)
+        rawDiff = unifiedDiff(previous, '', `a/${normalizedPath}`, `b/${normalizedPath}`)
+      }
+      break
+    }
+  }
+
+  const preconditionError = mode === 'create' && expectedVersion !== 'absent'
+    ? { code: 'FILE_EXISTS' as const, path: normalizedPath, hint: ERROR_HINTS.FILE_EXISTS }
+    : mode === 'update' && expectedVersion === 'absent'
+      ? { code: 'FILE_NOT_FOUND' as const, path: normalizedPath, hint: ERROR_HINTS.FILE_NOT_FOUND }
+      : null
 
   return {
     path: normalizedPath,
@@ -157,14 +316,15 @@ function buildCandidate(proposal: ObservedFileProposal, config: TransactionConfi
     expectedVersion,
     observedRevision: proposal.observation.repoRevision,
     content,
+    preconditionError,
     result: {
       path: normalizedPath,
       mode,
       status,
-      lines: countLines(content),
-      added: mode === 'append' ? status === 'unchanged' ? 0 : countLines(proposed) : stats.added,
-      removed: mode === 'append' ? 0 : stats.removed,
-      diffText,
+      lines: content === null ? 0 : countLines(content),
+      added,
+      removed,
+      diffText: selectDiff(rawDiff, block.diff as FileBlockDiff, config.diffLineLimit),
     },
   }
 }
@@ -193,6 +353,10 @@ function buildTree(root: string, head: string, candidates: readonly Candidate[])
   try {
     git(root, ['read-tree', head], undefined, env)
     for (const candidate of candidates) {
+      if (candidate.content === null) {
+        git(root, ['update-index', '--force-remove', '--', candidate.path], undefined, env)
+        continue
+      }
       const oid = git(root, ['hash-object', '-w', '--stdin'], candidate.content).trim()
       const currentEntry = treeEntryAt(root, head, candidate.path)
       const mode = currentEntry.mode === '100755' ? '100755' : '100644'
@@ -202,6 +366,69 @@ function buildTree(root: string, head: string, candidates: readonly Candidate[])
   } finally {
     rmSync(indexPath, { force: true })
   }
+}
+
+function findWorktreeDirty(
+  root: string,
+  fromRevision: string,
+  targetTreeish: string,
+  extraPaths: readonly string[],
+): DirtyFile[] {
+  const changed = git(root, ['diff', '--name-only', '--no-renames', '-z', fromRevision, targetTreeish])
+    .split('\0')
+    .filter(path => path.length > 0)
+  const paths = [...new Set([...changed, ...extraPaths])]
+  const dirty: DirtyFile[] = []
+
+  for (const path of paths) {
+    const expectedVersion = fileVersionAt(root, fromRevision, path)
+    const targetVersion = fileVersionAt(root, targetTreeish, path)
+    const worktree = readWorktreeEntry(root, path)
+    if (worktree.version === expectedVersion || worktree.version === targetVersion) continue
+    dirty.push({
+      path,
+      content: worktree.content,
+      fileVersion: worktree.version,
+      expectedVersion,
+      targetVersion,
+    })
+  }
+  return dirty
+}
+
+function readWorktreeEntry(root: string, path: string): WorktreeEntry {
+  const target = join(root, path)
+  let stat: ReturnType<typeof lstatSync>
+  try {
+    stat = lstatSync(target)
+  } catch (error: unknown) {
+    if (isNodeError(error) && error.code === 'ENOENT') return { version: 'absent', content: null }
+    throw error
+  }
+
+  if (stat.isSymbolicLink()) {
+    const content = readlinkSync(target)
+    return {
+      version: hashBuffer(root, Buffer.from(content)),
+      content,
+    }
+  }
+  if (!stat.isFile()) return { version: 'non-file', content: null }
+
+  const buffer = readFileSync(target)
+  return {
+    version: hashBuffer(root, buffer),
+    content: buffer.toString('utf8'),
+  }
+}
+
+function hashBuffer(root: string, buffer: Buffer): string {
+  return execFileSync('git', ['hash-object', '--stdin'], {
+    cwd: root,
+    encoding: 'utf8',
+    input: buffer,
+    stdio: ['pipe', 'pipe', 'pipe'],
+  }).trim()
 }
 
 function createCommit(root: string, tree: string, parent: string, agentId: string, paths: readonly string[]): string {
@@ -242,6 +469,10 @@ function treeEntryAt(root: string, revision: string, path: string): TreeEntry {
   const match = /^(\d+)\s+blob\s+([0-9a-f]+)\t/.exec(output)
   if (match === null) throw new Error(`path is not a regular Git blob: ${path}`)
   return { mode: match[1]!, version: match[2]! }
+}
+
+function treeForRevision(root: string, revision: string): string {
+  return git(root, ['rev-parse', `${revision}^{tree}`]).trim()
 }
 
 function readObservedContent(root: string, version: FileVersion): string {
@@ -337,15 +568,17 @@ function countLines(content: string): number {
   return content.endsWith('\n') ? newlines : newlines + 1
 }
 
-function renderDiff(oldText: string, newText: string, path: string, strategy: FileBlockDiff, limit: number): string | null {
-  if (strategy === 'none') return null
-  const full = unifiedDiff(oldText, newText, `a/${path}`, `b/${path}`)
-  if (full === null || strategy === 'stats') return null
+function selectDiff(full: string | null, strategy: FileBlockDiff, limit: number): string | null {
+  if (full === null || strategy === 'none' || strategy === 'stats') return null
   if (strategy === 'full') return full
   const lines = full.split('\n')
   if (lines.length <= limit) return full
   const stats = countDiffStats(lines)
   return `${lines.slice(0, limit).join('\n')}\n[b2f] diff truncated to ${limit} lines (+${stats.added}/-${stats.removed})`
+}
+
+function isNodeError(error: unknown): error is NodeJS.ErrnoException {
+  return error instanceof Error && 'code' in error
 }
 
 function git(root: string, args: readonly string[], input?: string, env: NodeJS.ProcessEnv = process.env): string {
