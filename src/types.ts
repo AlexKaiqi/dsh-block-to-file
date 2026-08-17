@@ -239,4 +239,4 @@ export const ERROR_HINTS: Record<B2FErrorCode, string> = {
   FILE_NOT_FOUND: 'mode=update requires an existing file; use mode=create or mode=write after checking the path',
   MATERIALIZE_FAILED: 'retry the operation, or check repository state, disk space, and permissions',
 }
-```共享类型已补写。接下来重构事务核心：所有 mode 都基于真实 observation 做 CAS；`create/update` 先通过版本比较排除并发变化，再检查存在性；候选 tree 与当前 tree 相同则返回 `unchanged`；提交前会比较受影响路径在工作区、来源快照和目标 tree 的 blob，避免覆盖第三种本地状态。
+```等待本次 b2f 提交反馈后继续，避免异步消息再次混入文件内容。
