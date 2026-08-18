@@ -33,7 +33,7 @@ export interface ValidationResult {
   readonly errors: readonly B2FError[]
 }
 
-const MODES = new Set(['write', 'create', 'append'])
+const MODES = new Set(['write', 'create', 'update', 'append', 'delete'])
 const DIFFS = new Set(['full', 'limited', 'stats', 'none'])
 const NEWLINES = new Set(['preserve', 'lf', 'crlf'])
 
@@ -51,7 +51,6 @@ export function validateFileBlocks(
   const validated: ValidatedFileBlock[] = []
   const seen = new Map<string, number>()
 
-  // Cross-block checks need a first pass over normalized paths.
   const normalized: { block: FileBlock; normalizedPath: string; targetPath: string }[] = []
   for (const block of blocks) {
     const normalizedPath = normalizePath(block.path, errors)
@@ -103,6 +102,13 @@ export function validateFileBlocks(
         code: 'INVALID_NEWLINE',
         path: block.path,
         hint: `${ERROR_HINTS.INVALID_NEWLINE} (got ${JSON.stringify(block.newline)})`,
+      })
+    }
+    if (block.mode === 'delete' && block.content.length > 0) {
+      errors.push({
+        code: 'DELETE_CONTENT',
+        path: block.path,
+        hint: ERROR_HINTS.DELETE_CONTENT,
       })
     }
     if (!isWellFormedUtf16(block.content)) {
@@ -159,8 +165,6 @@ function normalizePath(rawPath: string, errors: B2FError[]): string | null {
     return null
   }
 
-  // The protocol uses `/` separators; accept Windows-style separators by
-  // normalizing them, then reject Windows drive letters and absolute forms.
   const slashed = rawPath.replaceAll('\\', '/')
   if (slashed.startsWith('/')) {
     errors.push({ code: 'PATH_ABSOLUTE', path: rawPath, hint: ERROR_HINTS.PATH_ABSOLUTE })

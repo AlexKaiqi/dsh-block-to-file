@@ -4,7 +4,7 @@
  */
 
 /** Valid block materialization modes. */
-export type FileBlockMode = 'write' | 'create' | 'append'
+export type FileBlockMode = 'write' | 'create' | 'update' | 'append' | 'delete'
 
 /** Valid diff feedback strategies. */
 export type FileBlockDiff = 'full' | 'limited' | 'stats' | 'none'
@@ -61,9 +61,12 @@ export type B2FErrorCode =
   | 'UNKNOWN_ATTR'
   | 'DUPLICATE_ATTR'
   | 'ENCODING_INVALID'
+  | 'DELETE_CONTENT'
+  | 'FILE_EXISTS'
+  | 'FILE_NOT_FOUND'
   | 'MATERIALIZE_FAILED'
 
-/** One actionable validation or materialization failure. */
+/** One actionable validation, precondition, or materialization failure. */
 export interface B2FError {
   readonly code: B2FErrorCode
   /** Target path as written by the model, when one exists. */
@@ -72,9 +75,9 @@ export interface B2FError {
 }
 
 /** Materialization status for one file block. */
-export type MaterializeStatus = 'created' | 'updated' | 'appended' | 'unchanged'
+export type MaterializeStatus = 'created' | 'updated' | 'appended' | 'deleted' | 'unchanged'
 
-/** Outcome for one successfully written file block. */
+/** Outcome for one successfully evaluated file block. */
 export interface MaterializeResult {
   readonly path: string
   readonly mode: FileBlockMode
@@ -102,11 +105,38 @@ export interface StaleFile {
   readonly changesSinceRead: readonly ChangeSinceRead[]
 }
 
+/** Canonical state returned when an operation's existence precondition fails. */
+export interface PreconditionFile {
+  readonly path: string
+  readonly content: string | null
+  readonly fileVersion: FileVersion
+}
+
+/** A worktree path that differs from both the projected source and target. */
+export interface DirtyFile {
+  readonly path: string
+  readonly content: string | null
+  readonly fileVersion: FileVersion | 'non-file'
+  readonly expectedVersion: FileVersion
+  readonly targetVersion: FileVersion
+}
+
 /** A whole assistant message was committed as one Git transaction. */
 export interface B2FCommittedReport {
   readonly status: 'committed'
   readonly ok: true
   readonly commit: string
+  readonly repoRevision: string
+  readonly results: readonly MaterializeResult[]
+  readonly errors: readonly []
+  readonly staleFiles: readonly []
+}
+
+/** Every proposal was already satisfied, so no commit was created. */
+export interface B2FUnchangedReport {
+  readonly status: 'unchanged'
+  readonly ok: true
+  readonly commit: null
   readonly repoRevision: string
   readonly results: readonly MaterializeResult[]
   readonly errors: readonly []
@@ -122,6 +152,30 @@ export interface B2FStaleReport {
   readonly results: readonly []
   readonly errors: readonly []
   readonly staleFiles: readonly StaleFile[]
+}
+
+/** No proposal was committed because a mode existence condition was not met. */
+export interface B2FPreconditionFailedReport {
+  readonly status: 'precondition-failed'
+  readonly ok: false
+  readonly commit: null
+  readonly repoRevision: string
+  readonly results: readonly []
+  readonly errors: readonly B2FError[]
+  readonly staleFiles: readonly []
+  readonly files: readonly PreconditionFile[]
+}
+
+/** No proposal was committed because projection would overwrite local drift. */
+export interface B2FWorktreeDirtyReport {
+  readonly status: 'worktree-dirty'
+  readonly ok: false
+  readonly commit: null
+  readonly repoRevision: string
+  readonly results: readonly []
+  readonly errors: readonly []
+  readonly staleFiles: readonly []
+  readonly dirtyFiles: readonly DirtyFile[]
 }
 
 /** Parsing, validation, or pre-publication repository failure. */
@@ -147,7 +201,14 @@ export interface B2FProjectionFailedReport {
 }
 
 /** Full transactional outcome of one assistant message's b2f pipeline run. */
-export type B2FReport = B2FCommittedReport | B2FStaleReport | B2FFailedReport | B2FProjectionFailedReport
+export type B2FReport =
+  | B2FCommittedReport
+  | B2FUnchangedReport
+  | B2FStaleReport
+  | B2FPreconditionFailedReport
+  | B2FWorktreeDirtyReport
+  | B2FFailedReport
+  | B2FProjectionFailedReport
 
 /** Per-step pipeline state retained between session/event and tools/pre-execute. */
 export interface StepB2FState {
@@ -157,7 +218,7 @@ export interface StepB2FState {
   readonly feedback: string
 }
 
-/** Hints injected into validation failures. */
+/** Hints injected into validation and precondition failures. */
 export const ERROR_HINTS: Record<B2FErrorCode, string> = {
   PATH_REQUIRED: 'add file=<relative-path> to the fenced code block info string',
   PATH_ABSOLUTE: 'use a path relative to $DSH_B2F_ROOT, e.g. file=src/app.py',
@@ -166,12 +227,15 @@ export const ERROR_HINTS: Record<B2FErrorCode, string> = {
   SIZE_EXCEEDED: 'split the file into smaller files or reduce its content',
   TOTAL_SIZE_EXCEEDED: 'split the content across multiple assistant messages',
   TOO_MANY_FILES: 'split the file blocks across multiple assistant messages',
-  INVALID_MODE: 'use one of mode=write, mode=create, or mode=append',
+  INVALID_MODE: 'use one of mode=write, mode=create, mode=update, mode=append, or mode=delete',
   INVALID_DIFF: 'use one of diff=full, diff=limited, diff=stats, or diff=none',
   INVALID_ENCODING: 'omit the encoding attribute (only utf-8 is supported)',
   INVALID_NEWLINE: 'use one of newline=preserve, newline=lf, or newline=crlf',
   UNKNOWN_ATTR: 'check the attribute spelling; known attributes are file, mode, diff, encoding, newline',
   DUPLICATE_ATTR: 'specify each attribute once per fenced code block',
   ENCODING_INVALID: 'emit UTF-8 text only',
-  MATERIALIZE_FAILED: 'retry the write, or check available disk space and permissions',
+  DELETE_CONTENT: 'mode=delete requires an empty fenced block',
+  FILE_EXISTS: 'mode=create requires the target to be absent; use mode=update or mode=write after reviewing it',
+  FILE_NOT_FOUND: 'mode=update requires an existing file; use mode=create or mode=write after checking the path',
+  MATERIALIZE_FAILED: 'retry the operation, or check repository state, disk space, and permissions',
 }

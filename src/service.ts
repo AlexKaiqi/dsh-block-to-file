@@ -113,10 +113,12 @@ export class B2FService extends Service {
       maxCasRetries: config.maxCasRetries,
     }
     const report = commitFileBlocks(proposals, transactionConfig)
-    if (report.status === 'committed' || report.status === 'stale') {
+
+    if (report.status === 'committed' || report.status === 'unchanged' || report.status === 'stale') {
       this.snapshots.set(agent.id, { root, repoRevision: report.repoRevision })
     }
-    if (report.status === 'committed') {
+
+    if (report.status === 'committed' || report.status === 'unchanged') {
       for (const entry of validated) {
         this.recordObservation(agent.id, {
           path: entry.normalizedPath,
@@ -132,7 +134,16 @@ export class B2FService extends Service {
           repoRevision: file.repoRevision,
         })
       }
+    } else if (report.status === 'precondition-failed') {
+      for (const file of report.files) {
+        this.recordObservation(agent.id, {
+          path: file.path,
+          fileVersion: file.fileVersion,
+          repoRevision: report.repoRevision,
+        })
+      }
     }
+
     return report
   }
 }
