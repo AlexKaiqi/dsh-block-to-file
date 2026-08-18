@@ -106,7 +106,6 @@ describe('Git file transactions', () => {
     const base = resolveCanonicalRevision(root, REF)
     const first = commit(root, 'agent-b', base, '```text file=b.txt\nb1\n```\n')
     expect(first.status).toBe('committed')
-    // Simulate agent-a's isolated worktree still projecting its old snapshot.
     writeFileSync(join(root, 'b.txt'), 'b0\n')
 
     const second = commit(root, 'agent-a', base, '```text file=a.txt\na1\n```\n')
@@ -116,18 +115,117 @@ describe('Git file transactions', () => {
     expect(readFileSync(join(root, 'b.txt'), 'utf8')).toBe('b1\n')
   })
 
-  it('treats mode=create as an expected-absent comparison', () => {
+  it('reports create on an existing observation as a precondition failure', () => {
     const root = makeRepository({ 'existing.txt': 'old\n' })
     const base = resolveCanonicalRevision(root, REF)
     const report = commit(root, 'agent-a', base, '```text file=existing.txt mode=create\nnew\n```\n')
 
+    expect(report.status).toBe('precondition-failed')
+    if (report.status !== 'precondition-failed') return
+    expect(report.errors[0]?.code).toBe('FILE_EXISTS')
+    expect(report.files[0]).toMatchObject({
+      path: 'existing.txt',
+      content: 'old\n',
+    })
+  })
+
+  it('reports update on an absent observation as a precondition failure', () => {
+    const root = makeRepository()
+    const base = resolveCanonicalRevision(root, REF)
+    const report = commit(root, 'agent-a', base, '```text file=missing.txt mode=update\nnew\n```\n')
+
+    expect(report.status).toBe('precondition-failed')
+    if (report.status !== 'precondition-failed') return
+    expect(report.errors[0]?.code).toBe('FILE_NOT_FOUND')
+    expect(report.files[0]).toMatchObject({
+      path: 'missing.txt',
+      content: null,
+      fileVersion: 'absent',
+    })
+  })
+
+  it('treats a create target appearing after observation as stale', () => {
+    const root = makeRepository()
+    const base = resolveCanonicalRevision(root, REF)
+    const winner = commit(root, 'agent-b', base, '```text file=new.txt\nwinner\n```\n')
+    expect(winner.status).toBe('committed')
+
+    const report = commit(root, 'agent-a', base, '```text file=new.txt mode=create\nloser\n```\n')
     expect(report.status).toBe('stale')
     if (report.status !== 'stale') return
     expect(report.staleFiles[0]).toMatchObject({
-      path: 'existing.txt',
-      content: 'old\n',
+      path: 'new.txt',
+      content: 'winner\n',
       observedVersion: 'absent',
     })
+  })
+
+  it('updates an existing file with mode=update', () => {
+    const root = makeRepository({ 'existing.txt': 'old\n' })
+    const base = resolveCanonicalRevision(root, REF)
+    const report = commit(root, 'agent-a', base, '```text file=existing.txt mode=update\nnew\n```\n')
+
+    expect(report.status).toBe('committed')
+    if (report.status !== 'committed') return
+    expect(report.results[0]?.status).toBe('updated')
+    expect(readFileSync(join(root, 'existing.txt'), 'utf8')).toBe('new\n')
+  })
+
+  it('reports append to an absent path as created', () => {
+    const root = makeRepository()
+    const base = resolveCanonicalRevision(root, REF)
+    const report = commit(root, 'agent-a', base, '```text file=log.txt mode=append\nfirst\n```\n')
+
+    expect(report.status).toBe('committed')
+    if (report.status !== 'committed') return
+    expect(report.results[0]?.status).toBe('created')
+    expect(readFileSync(join(root, 'log.txt'), 'utf8')).toBe('first\n')
+  })
+
+  it('deletes an existing path from canonical and worktree', () => {
+    const root = makeRepository({ 'old.txt': 'old\ncontent\n' })
+    const base = resolveCanonicalRevision(root, REF)
+    const report = commit(root, 'agent-a', base, '```text file=old.txt mode=delete\n```\n')
+
+    expect(report.status).toBe('committed')
+    if (report.status !== 'committed') return
+    expect(report.results[0]).toMatchObject({ status: 'deleted', removed: 2 })
+    expect(fileVersionAt(root, report.repoRevision, 'old.txt')).toBe('absent')
+    expect(() => readFileSync(join(root, 'old.txt'), 'utf8')).toThrow()
+  })
+
+  it('returns unchanged without a commit for satisfied operations', () => {
+    const root = makeRepository({ 'same.txt': 'same\n' })
+    const base = resolveCanonicalRevision(root, REF)
+    const report = commit(
+      root,
+      'agent-a',
+      base,
+      '```text file=same.txt mode=update\nsame\n```\n```text file=missing.txt mode=delete\n```\n',
+    )
+
+    expect(report.status).toBe('unchanged')
+    if (report.status !== 'unchanged') return
+    expect(report.commit).toBeNull()
+    expect(report.repoRevision).toBe(base)
+    expect(report.results.map(result => result.status)).toEqual(['unchanged', 'unchanged'])
+    expect(resolveCanonicalRevision(root, REF)).toBe(base)
+  })
+
+  it('rejects a transaction that would overwrite worktree drift', () => {
+    const root = makeRepository({ 'local.txt': 'canonical\n' })
+    const base = resolveCanonicalRevision(root, REF)
+    rmSync(join(root, 'local.txt'))
+
+    const report = commit(root, 'agent-a', base, '```text file=local.txt mode=update\nproposed\n```\n')
+    expect(report.status).toBe('worktree-dirty')
+    if (report.status !== 'worktree-dirty') return
+    expect(report.dirtyFiles[0]).toMatchObject({
+      path: 'local.txt',
+      content: null,
+      fileVersion: 'absent',
+    })
+    expect(resolveCanonicalRevision(root, REF)).toBe(base)
   })
 
   it('allows a path changed and restored to the observed blob', () => {

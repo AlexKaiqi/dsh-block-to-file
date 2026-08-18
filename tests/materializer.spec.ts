@@ -54,7 +54,31 @@ describe('materializeAll', () => {
     expect(readFileSync(join(root, 'app.py'), 'utf8')).toBe('def main():\n    print("new")\n    return 0\n')
   })
 
-  it('appends to existing files and creates missing ones', () => {
+  it('enforces create and update existence preconditions', () => {
+    const root = makeRoot()
+    writeFileSync(join(root, 'existing.txt'), 'old\n')
+
+    const create = run('```text file=existing.txt mode=create\nnew\n```\n', root)
+    expect(create.errors[0]?.code).toBe('FILE_EXISTS')
+    expect(readFileSync(join(root, 'existing.txt'), 'utf8')).toBe('old\n')
+
+    const update = run('```text file=missing.txt mode=update\nnew\n```\n', root)
+    expect(update.errors[0]?.code).toBe('FILE_NOT_FOUND')
+    expect(existsSync(join(root, 'missing.txt'))).toBe(false)
+  })
+
+  it('updates existing files and skips unchanged content', () => {
+    const root = makeRoot()
+    writeFileSync(join(root, 'value.txt'), 'old\n')
+
+    const updated = run('```text file=value.txt mode=update\nnew\n```\n', root)
+    expect(updated.results[0]?.status).toBe('updated')
+
+    const unchanged = run('```text file=value.txt mode=update\nnew\n```\n', root)
+    expect(unchanged.results[0]?.status).toBe('unchanged')
+  })
+
+  it('appends to existing files and reports missing ones as created', () => {
     const root = makeRoot()
     writeFileSync(join(root, 'log.txt'), 'a\n')
     const first = run('```text file=log.txt mode=append\nb\nc\n```\n', root)
@@ -62,7 +86,7 @@ describe('materializeAll', () => {
     expect(readFileSync(join(root, 'log.txt'), 'utf8')).toBe('a\nb\nc\n')
 
     const second = run('```text file=new.txt mode=append\nx\n```\n', root)
-    expect(second.results[0]!.status).toBe('appended')
+    expect(second.results[0]!.status).toBe('created')
     expect(readFileSync(join(root, 'new.txt'), 'utf8')).toBe('x\n')
   })
 
@@ -75,6 +99,18 @@ describe('materializeAll', () => {
     expect(second.results[0]?.status).toBe('unchanged')
     expect(second.results[0]?.added).toBe(0)
     expect(readFileSync(join(root, 'log.txt'), 'utf8')).toBe('a\nb\n')
+  })
+
+  it('deletes existing files and skips absent paths', () => {
+    const root = makeRoot()
+    writeFileSync(join(root, 'old.txt'), 'old\ncontent\n')
+
+    const deleted = run('```text file=old.txt mode=delete\n```\n', root)
+    expect(deleted.results[0]).toMatchObject({ status: 'deleted', removed: 2 })
+    expect(existsSync(join(root, 'old.txt'))).toBe(false)
+
+    const unchanged = run('```text file=old.txt mode=delete\n```\n', root)
+    expect(unchanged.results[0]?.status).toBe('unchanged')
   })
 
   it('preserves dollar signs, quotes, and backslashes verbatim', () => {
