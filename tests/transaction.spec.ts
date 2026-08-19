@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it } from 'vitest'
 import { parseFileBlocks } from '../src/parser.ts'
 import { commitFileBlocks, fileVersionAt, resolveCanonicalRevision } from '../src/transaction.ts'
 import type { ObservedFileProposal, TransactionConfig } from '../src/transaction.ts'
+import { resolveGitDir } from '../src/materializer.ts'
 import { validateFileBlocks } from '../src/validator.ts'
 import type { EditFormat } from '../src/types.ts'
 
@@ -25,9 +26,15 @@ function makeRepository(files: Record<string, string> = {}): string {
   }
   execFileSync('git', ['add', '--all'], { cwd: root })
   execFileSync('git', ['commit', '--quiet', '--allow-empty', '-m', 'initial'], { cwd: root, env: gitIdentity() })
-  roots.push(root)
-  roots.push(`${root}.b2f-tmp`)
+  roots.push(root, `${root}.b2f-tmp`, resolveGitDir(root))
   return root
+}
+
+function managedGit(root: string, args: readonly string[]): string {
+  return execFileSync('git', ['--git-dir', resolveGitDir(root), '--work-tree', root, ...args], {
+    cwd: root,
+    encoding: 'utf8',
+  })
 }
 
 function gitIdentity(): NodeJS.ProcessEnv {
@@ -79,6 +86,42 @@ afterEach(() => {
 })
 
 describe('Git file transactions', () => {
+  it('bootstraps an isolated Git store for a workspace without .git', () => {
+    const root = mkdtempSync(join(tmpdir(), 'dsh-b2f-workspace-'))
+    roots.push(root, `${root}.b2f-tmp`, resolveGitDir(root))
+    writeFileSync(join(root, 'existing.txt'), 'before\n')
+
+    const base = resolveCanonicalRevision(root, REF)
+    expect(existsSync(join(root, '.git'))).toBe(false)
+    expect(existsSync(join(resolveGitDir(root), 'HEAD'))).toBe(true)
+    expect(fileVersionAt(root, base, 'existing.txt')).not.toBe('absent')
+
+    const report = commit(root, 'agent-a', base, '```text file=existing.txt\nafter\n```\n')
+    expect(report.status).toBe('committed')
+    expect(readFileSync(join(root, 'existing.txt'), 'utf8')).toBe('after\n')
+    expect(existsSync(join(root, '.git'))).toBe(false)
+  })
+
+  it('snapshots tracked files from nested repositories without requiring a root repository', () => {
+    const root = mkdtempSync(join(tmpdir(), 'dsh-b2f-multi-repo-workspace-'))
+    const nested = join(root, 'package-a')
+    mkdirSync(nested)
+    writeFileSync(join(nested, 'tracked.txt'), 'before\n')
+    execFileSync('git', ['init', '--quiet'], { cwd: nested })
+    execFileSync('git', ['config', 'core.hooksPath', '/dev/null'], { cwd: nested })
+    execFileSync('git', ['add', 'tracked.txt'], { cwd: nested })
+    execFileSync('git', ['commit', '--quiet', '-m', 'initial'], { cwd: nested, env: gitIdentity() })
+    roots.push(root, `${root}.b2f-tmp`, resolveGitDir(root))
+
+    const base = resolveCanonicalRevision(root, REF)
+    expect(existsSync(join(root, '.git'))).toBe(false)
+    expect(fileVersionAt(root, base, 'package-a/tracked.txt')).not.toBe('absent')
+
+    const report = commit(root, 'agent-a', base, '```text file=package-a/tracked.txt\nafter\n```\n')
+    expect(report.status).toBe('committed')
+    expect(readFileSync(join(nested, 'tracked.txt'), 'utf8')).toBe('after\n')
+  })
+
   it('publishes all blocks in one commit', () => {
     const root = makeRepository()
     const base = resolveCanonicalRevision(root, REF)
@@ -87,9 +130,9 @@ describe('Git file transactions', () => {
     expect(report.status).toBe('committed')
     if (report.status !== 'committed') return
     expect(report.results).toHaveLength(2)
-    expect(execFileSync('git', ['rev-parse', `${report.commit}^`], { cwd: root, encoding: 'utf8' }).trim()).toBe(base)
-    expect(execFileSync('git', ['show', `${REF}:a.txt`], { cwd: root, encoding: 'utf8' })).toBe('a\n')
-    expect(execFileSync('git', ['show', `${REF}:b.txt`], { cwd: root, encoding: 'utf8' })).toBe('b\n')
+    expect(managedGit(root, ['rev-parse', `${report.commit}^`]).trim()).toBe(base)
+    expect(managedGit(root, ['show', `${REF}:a.txt`])).toBe('a\n')
+    expect(managedGit(root, ['show', `${REF}:b.txt`])).toBe('b\n')
   })
 
   it('rejects an entire transaction when one target changed', () => {
@@ -116,8 +159,8 @@ describe('Git file transactions', () => {
 
     const second = commit(root, 'agent-a', base, '```text file=a.txt\na1\n```\n')
     expect(second.status).toBe('committed')
-    expect(execFileSync('git', ['show', `${REF}:a.txt`], { cwd: root, encoding: 'utf8' })).toBe('a1\n')
-    expect(execFileSync('git', ['show', `${REF}:b.txt`], { cwd: root, encoding: 'utf8' })).toBe('b1\n')
+    expect(managedGit(root, ['show', `${REF}:a.txt`])).toBe('a1\n')
+    expect(managedGit(root, ['show', `${REF}:b.txt`])).toBe('b1\n')
     expect(readFileSync(join(root, 'b.txt'), 'utf8')).toBe('b1\n')
   })
 
@@ -275,7 +318,7 @@ describe('Git file transactions', () => {
 
     const report = commit(root, 'agent-a', base, '```bash file=run.sh\n#!/bin/sh\necho new\n```\n')
     expect(report.status).toBe('committed')
-    expect(execFileSync('git', ['ls-tree', REF, '--', 'run.sh'], { cwd: root, encoding: 'utf8' })).toMatch(/^100755 /)
+    expect(managedGit(root, ['ls-tree', REF, '--', 'run.sh'])).toMatch(/^100755 /)
     expect(statSync(join(root, 'run.sh')).mode & 0o777).toBe(0o755)
   })
 
@@ -439,7 +482,7 @@ describe('Git file transactions', () => {
       'replace',
     )
     expect(report.status).toBe('committed')
-    expect(execFileSync('git', ['ls-tree', REF, '--', 'run.sh'], { cwd: root, encoding: 'utf8' })).toMatch(/^100755 /)
+    expect(managedGit(root, ['ls-tree', REF, '--', 'run.sh'])).toMatch(/^100755 /)
     expect(statSync(join(root, 'run.sh')).mode & 0o777).toBe(0o755)
     expect(readFileSync(join(root, 'run.sh'), 'utf8')).toBe('#!/bin/sh\necho new\n')
   })

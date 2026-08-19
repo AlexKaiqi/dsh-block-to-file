@@ -16,7 +16,7 @@ import { afterEach, describe, expect, it } from 'vitest'
 import { parseFileBlocks } from '../src/parser.ts'
 import { commitFileBlocks, fileVersionAt, resolveCanonicalRevision } from '../src/transaction.ts'
 import type { ObservedFileProposal, TransactionConfig } from '../src/transaction.ts'
-import { resolveTempDir, sweepTempDir } from '../src/materializer.ts'
+import { resolveGitDir, resolveTempDir, sweepTempDir } from '../src/materializer.ts'
 import { validateFileBlocks } from '../src/validator.ts'
 
 const roots: string[] = []
@@ -42,7 +42,7 @@ function makeRepository(files: Record<string, string> = {}): string {
   }
   execFileSync('git', ['add', '--all'], { cwd: root })
   execFileSync('git', ['commit', '--quiet', '--allow-empty', '-m', 'initial'], { cwd: root, env: gitIdentity() })
-  roots.push(root, `${root}.b2f-tmp`)
+  roots.push(root, `${root}.b2f-tmp`, resolveGitDir(root))
   return root
 }
 
@@ -82,9 +82,16 @@ function commit(root: string, agentId: string, observedRevision: string, text: s
 
 /** Commits reachable from the canonical ref, newest first. */
 function refLog(root: string): string[] {
-  return execFileSync('git', ['rev-list', REF], { cwd: root, encoding: 'utf8' })
+  return managedGit(root, ['rev-list', REF])
     .split('\n')
     .filter(line => line.length > 0)
+}
+
+function managedGit(root: string, args: readonly string[]): string {
+  return execFileSync('git', ['--git-dir', resolveGitDir(root), '--work-tree', root, ...args], {
+    cwd: root,
+    encoding: 'utf8',
+  })
 }
 
 afterEach(() => {
@@ -199,11 +206,11 @@ describe('crash recovery', () => {
     expect(second.status).toBe('committed')
     if (second.status !== 'committed') return
 
-    expect(execFileSync('git', ['show', `${REF}:a.txt`], { cwd: root, encoding: 'utf8' })).toBe('a1\n')
-    expect(execFileSync('git', ['show', `${REF}:b.txt`], { cwd: root, encoding: 'utf8' })).toBe('b1\n')
+    expect(managedGit(root, ['show', `${REF}:a.txt`])).toBe('a1\n')
+    expect(managedGit(root, ['show', `${REF}:b.txt`])).toBe('b1\n')
     // The winner's commit is an ancestor: history is linear, nothing was discarded.
     expect(refLog(root)).toContain(first.repoRevision)
-    expect(execFileSync('git', ['rev-parse', `${second.repoRevision}^`], { cwd: root, encoding: 'utf8' }).trim())
+    expect(managedGit(root, ['rev-parse', `${second.repoRevision}^`]).trim())
       .toBe(first.repoRevision)
   })
 
@@ -250,7 +257,7 @@ describe('crash recovery', () => {
     const root = makeRepository({ 'a.txt': 'v0\n' })
     const base = resolveCanonicalRevision(root, REF)
     // Point the ref at a non-existent object, as a torn ref update would.
-    writeFileSync(join(root, '.git', REF), `${'0'.repeat(40)}\n`)
+    writeFileSync(join(resolveGitDir(root), REF), `${'0'.repeat(40)}\n`)
 
     const report = commit(root, 'agent-a', base, '```text file=a.txt\nv1\n```\n')
     expect(report.ok).toBe(false)
