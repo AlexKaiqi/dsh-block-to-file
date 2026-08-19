@@ -24,6 +24,7 @@ export interface B2FCommitConfig {
   readonly diffLineLimit: number
   readonly tempFileKeep: number
   readonly maxCasRetries: number
+  readonly maxEditDrift: number
 }
 
 interface AgentSnapshot {
@@ -111,39 +112,79 @@ export class B2FService extends Service {
       diffLineLimit: config.diffLineLimit,
       tempFileKeep: config.tempFileKeep,
       maxCasRetries: config.maxCasRetries,
+      maxEditDrift: config.maxEditDrift,
     }
     const report = commitFileBlocks(proposals, transactionConfig)
-
-    if (report.status === 'committed' || report.status === 'unchanged' || report.status === 'stale') {
-      this.snapshots.set(agent.id, { root, repoRevision: report.repoRevision })
-    }
-
-    if (report.status === 'committed' || report.status === 'unchanged') {
-      for (const entry of validated) {
-        this.recordObservation(agent.id, {
-          path: entry.normalizedPath,
-          fileVersion: fileVersionAt(root, report.repoRevision, entry.normalizedPath),
-          repoRevision: report.repoRevision,
-        })
-      }
-    } else if (report.status === 'stale') {
-      for (const file of report.staleFiles) {
-        this.recordObservation(agent.id, {
-          path: file.path,
-          fileVersion: file.fileVersion,
-          repoRevision: file.repoRevision,
-        })
-      }
-    } else if (report.status === 'precondition-failed') {
-      for (const file of report.files) {
-        this.recordObservation(agent.id, {
-          path: file.path,
-          fileVersion: file.fileVersion,
-          repoRevision: report.repoRevision,
-        })
-      }
-    }
-
+    this.absorb(agent.id, root, validated, report)
     return report
+  }
+
+  /**
+   * Advance this agent's snapshot and per-path observations from one outcome.
+   *
+   * Exhaustive over `B2FReport['status']`: a new status must state its
+   * observation policy here rather than silently inheriting "record nothing",
+   * which would leave the agent observing a revision it can no longer see.
+   */
+  private absorb(
+    agentId: string,
+    root: string,
+    validated: readonly ValidatedFileBlock[],
+    report: B2FReport,
+  ): void {
+    switch (report.status) {
+      // Publication settled: the agent now observes what it just wrote.
+      case 'committed':
+      case 'unchanged': {
+        this.snapshots.set(agentId, { root, repoRevision: report.repoRevision })
+        for (const entry of validated) {
+          this.recordObservation(agentId, {
+            path: entry.normalizedPath,
+            fileVersion: fileVersionAt(root, report.repoRevision, entry.normalizedPath),
+            repoRevision: report.repoRevision,
+          })
+        }
+        return
+      }
+
+      // Rejected, but the feedback handed the model fresh content: adopt it as
+      // the new observation so an immediate retry compares against reality.
+      case 'stale': {
+        this.snapshots.set(agentId, { root, repoRevision: report.repoRevision })
+        for (const file of report.staleFiles) {
+          this.recordObservation(agentId, {
+            path: file.path,
+            fileVersion: file.fileVersion,
+            repoRevision: file.repoRevision,
+          })
+        }
+        return
+      }
+
+      // Rejected on an existence condition or an unresolvable edit anchor; the
+      // echoed versions were read at `head`, so they are current.
+      case 'precondition-failed':
+      case 'edit-unresolved': {
+        for (const file of report.files) {
+          this.recordObservation(agentId, {
+            path: file.path,
+            fileVersion: file.fileVersion,
+            repoRevision: report.repoRevision,
+          })
+        }
+        return
+      }
+
+      // Nothing was published and no canonical state was re-read, so the
+      // existing snapshot and observations remain accurate.
+      // - failed: parse/validation/repository error before publication.
+      // - worktree-dirty: local drift; canonical is untouched.
+      // - projection-failed: committed, but the worktree could not catch up;
+      //   tools stay blocked and the next step re-prepares the view.
+      case 'failed':
+      case 'worktree-dirty':
+      case 'projection-failed':
+        return
+    }
   }
 }

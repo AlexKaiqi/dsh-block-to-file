@@ -1,0 +1,85 @@
+{
+  "version": "1.0.0",
+  "name": "b2f-block-protocol",
+  "summary": "Fenced-code-block file protocol. A block whose info string carries file= is a write proposal; the runtime publishes all blocks of one assistant message as a single Git commit before any tool call in that message executes.",
+  "rationale": "This is deliberately not a DSH tool seam. Proposals must be observable in the assistant message itself and must commit atomically as a group, which a per-call tool interface cannot express.",
+  "blockAttributes": {
+    "file": {
+      "required": true,
+      "description": "Repository-relative target path. Absolute paths, drive letters, and `.`/`..` segments are rejected."
+    },
+    "mode": {
+      "required": false,
+      "default": "write",
+      "values": ["write", "create", "update", "append", "delete", "edit", "diff"],
+      "description": "edit and diff are partial-edit dialects; exactly one of them is accepted per deployment, selected by the editFormat configuration."
+    },
+    "diff": {
+      "required": false,
+      "default": "limited",
+      "values": ["full", "limited", "stats", "none"]
+    },
+    "encoding": {
+      "required": false,
+      "default": "utf-8",
+      "values": ["utf-8"]
+    },
+    "newline": {
+      "required": false,
+      "default": "preserve",
+      "values": ["preserve", "lf", "crlf"],
+      "description": "Rejected on edit and diff blocks, which preserve the file's existing line endings."
+    }
+  },
+  "editDialects": {
+    "replace": {
+      "mode": "edit",
+      "body": "One or more `<<<<<<< SEARCH` / `=======` / `>>>>>>> REPLACE` sections.",
+      "anchoring": "content",
+      "rules": [
+        "Each SEARCH must match the observed content exactly once.",
+        "Matched spans must be pairwise disjoint.",
+        "An empty REPLACE deletes the matched span."
+      ]
+    },
+    "git_diff": {
+      "mode": "diff",
+      "body": "Hunk-only unified diff. File headers (diff --git, index, ---, +++) are tolerated but not required.",
+      "anchoring": "line hint plus context",
+      "rules": [
+        "Stated hunk line counts are ignored and recomputed from the body.",
+        "The @@ start line is a hint; the anchor is located by context search, nearest match winning, within maxEditDrift lines.",
+        "Applied hunks must not overlap."
+      ]
+    }
+  },
+  "resolution": {
+    "basis": "observed Git blob",
+    "description": "Every proposal, full-content or partial, is resolved against the blob the model observed rather than the worktree, which is a managed projection. Partial edits resolve in-process and never route through `git apply`, so no clean/smudge filter or apply configuration can alter the proposed bytes."
+  },
+  "transaction": {
+    "granularity": "one assistant message",
+    "publication": "single commit on the canonical ref via compare-and-swap",
+    "atomicity": "If any block is stale, fails a precondition, would overwrite local drift, or has an unresolvable edit anchor, nothing is committed.",
+    "reportOrder": ["stale", "precondition-failed", "edit-unresolved"]
+  },
+  "feedback": {
+    "prefix": "[b2f]",
+    "statuses": [
+      "committed",
+      "unchanged",
+      "stale",
+      "precondition-failed",
+      "worktree-dirty",
+      "edit-unresolved",
+      "failed",
+      "projection-failed"
+    ],
+    "echoLabel": "path=",
+    "echoNote": "Informational content echoes are labelled path=, never file=, so a verbatim copy-back by the model is inert and writes nothing."
+  },
+  "observability": {
+    "event": "b2f/transaction",
+    "perBlockMetrics": ["editFormat", "editsProposed", "editsApplied", "fuzz"]
+  }
+}

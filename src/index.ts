@@ -21,26 +21,47 @@ import { parseFileBlocks as parseBlocks } from './parser.ts'
 import { validateFileBlocks as validateBlocks } from './validator.ts'
 import { assertTempDirOutsideRoot as assertTmpOutside, resolveTempDir, sweepTempDir } from './materializer.ts'
 import { renderFeedback as renderB2FFeedback } from './feedback.ts'
-import { DEFAULT_PROMPT } from './prompt.ts'
+import { DEFAULT_MAX_DRIFT } from './edit.ts'
+import { buildPrompt, DEFAULT_PROMPT } from './model/prompt.ts'
 import { B2FService as B2FServiceClass } from './service.ts'
-import type { B2FError, B2FReport, StepB2FState } from './types.ts'
+import type { B2FError, B2FReport, EditFormat, StepB2FState } from './types.ts'
 
 export { parseFileBlocks } from './parser.ts'
 export type { ParseResult } from './parser.ts'
 export { validateFileBlocks } from './validator.ts'
 export type { B2FValidationConfig, ValidatedFileBlock, ValidationResult } from './validator.ts'
 export { assertTempDirOutsideRoot, resolveTempDir, sweepTempDir } from './materializer.ts'
+export { DEFAULT_MAX_DRIFT, editError, resolveEdit } from './edit.ts'
+export type { EditFailure, EditOutcome, EditResolution } from './edit.ts'
+export { b2fError, BlockToFileError, isB2FError } from './errors.ts'
+export { buildPrompt, DEFAULT_PROMPT, GIT_DIFF_PROMPT, REPLACE_PROMPT } from './model/prompt.ts'
 export { commitFileBlocks, fileVersionAt, projectRevision, resolveCanonicalRevision, resolveWorktreeRevision } from './transaction.ts'
 export type { ObservedFileProposal, TransactionConfig } from './transaction.ts'
-export { renderFailureFeedback, renderFeedback, renderProjectionFailureFeedback, renderStaleFeedback, renderSuccessFeedback } from './feedback.ts'
+export { renderEditUnresolvedFeedback, renderFailureFeedback, renderFeedback, renderProjectionFailureFeedback, renderStaleFeedback, renderSuccessFeedback } from './feedback.ts'
 export { countDiffStats, unifiedDiff } from './diff.ts'
 export type { DiffHunk } from './diff.ts'
 export { B2FService } from './service.ts'
 export type { B2FCommitConfig, B2FRootResolver } from './service.ts'
-export type { B2FCommittedReport, B2FError, B2FErrorCode, B2FFailedReport, B2FProjectionFailedReport, B2FReport, B2FStaleReport, ChangeSinceRead, FileBlock, FileBlockDiff, FileBlockEncoding, FileBlockMode, FileBlockNewline, FileObservation, FileVersion, MaterializeResult, MaterializeStatus, StaleFile, StepB2FState } from './types.ts'
+export { EDIT_MODE_FOR_FORMAT } from './types.ts'
+export type { B2FCommittedReport, B2FEditUnresolvedReport, B2FError, B2FErrorCode, B2FFailedReport, B2FPreconditionFailedReport, B2FProjectionFailedReport, B2FReport, B2FStaleReport, B2FUnchangedReport, B2FWorktreeDirtyReport, ChangeSinceRead, DirtyFile, EditFormat, FileBlock, FileBlockDiff, FileBlockEncoding, FileBlockMode, FileBlockNewline, FileObservation, FileVersion, MaterializeResult, MaterializeStatus, PreconditionFile, StaleFile, StepB2FState } from './types.ts'
 
 export const name = 'block-to-file'
 export const inject = ['systemPrompt', 'tools', 'agents']
+
+declare module '@deepseek-ai/cordis' {
+  interface Events {
+    /**
+     * One b2f transaction settled. Carries the full report, including per-block
+     * `editFormat` / `editsProposed` / `editsApplied` / `fuzz`, so an external
+     * consumer can compute first-apply success rate, retry counts, and drift
+     * tolerance per edit dialect without this plugin aggregating anything.
+     * @param session - the session whose assistant message produced the blocks.
+     * @param report - the settled transactional outcome.
+     * @mode emit
+     */
+    'b2f/transaction'(session: Session, report: B2FReport): void
+  }
+}
 
 /** Deployment configuration for the b2f pipeline. */
 export interface Config {
@@ -58,6 +79,14 @@ export interface Config {
   maxCasRetries: number
   tempFileKeep: number
   newline: 'preserve' | 'lf' | 'crlf'
+  /**
+   * Which partial-edit dialect to expose. Exactly one is offered to the model,
+   * so it never has to choose a patch format; the other is rejected with a
+   * corrective error. `none` disables partial edits entirely.
+   */
+  editFormat: EditFormat
+  /** Lines a `mode=diff` hunk may drift from its stated start line. */
+  maxEditDrift: number
   prompt: string
 }
 
@@ -73,6 +102,8 @@ export const Config: z<Config> = z.object({
   maxCasRetries: z.number().default(8),
   tempFileKeep: z.number().default(16),
   newline: z.union(['preserve', 'lf', 'crlf'] as const).default('preserve'),
+  editFormat: z.union(['git_diff', 'replace', 'none'] as const).default('git_diff'),
+  maxEditDrift: z.number().default(DEFAULT_MAX_DRIFT),
   prompt: z.string().default(DEFAULT_PROMPT),
 })
 
@@ -87,6 +118,8 @@ interface ResolvedConfig {
   readonly maxCasRetries: number
   readonly tempFileKeep: number
   readonly newline: 'preserve' | 'lf' | 'crlf'
+  readonly editFormat: EditFormat
+  readonly maxEditDrift: number
   readonly prompt: string
 }
 
@@ -107,7 +140,7 @@ export function apply(ctx: Context, config: Config): void {
   ctx.systemPrompt.section({
     name: 'b2f:write-files',
     order: 90,
-    text: resolved.prompt,
+    text: buildPrompt(resolved.prompt, resolved.editFormat),
   })
 
   // Capture the immutable repository view on which the next model decision is based.
@@ -128,9 +161,12 @@ export function apply(ctx: Context, config: Config): void {
     if (agent === undefined) return
     const report = runPipeline(event.data.message.content, resolved, agent, session, ctx.b2f)
     if (report === null) return
-    const feedback = renderB2FFeedback(report)
+    // Line-anchored dialects need numbered echoes so the model can re-anchor;
+    // content-anchored ones need verbatim text to copy.
+    const feedback = renderB2FFeedback(report, resolved.editFormat === 'git_diff')
     const key = stateKey(session.id, event.data.turn, event.data.step)
     state.set(key, { turn: event.data.turn, step: event.data.step, report, feedback })
+    ctx.emit('b2f/transaction', session, report)
 
     queueMicrotask(() => {
       injectFeedback(agent, feedback)
@@ -182,6 +218,7 @@ function runPipeline(
     maxFileSize: config.maxFileSize,
     maxTotalSize: config.maxTotalSize,
     maxFilesPerMessage: config.maxFilesPerMessage,
+    editFormat: config.editFormat,
   })
 
   const errors: B2FError[] = [...parsed.errors, ...validation.errors]
@@ -192,6 +229,7 @@ function runPipeline(
     diffLineLimit: config.diffLineLimit,
     tempFileKeep: config.tempFileKeep,
     maxCasRetries: config.maxCasRetries,
+    maxEditDrift: config.maxEditDrift,
   })
 }
 
@@ -221,6 +259,8 @@ function resolveConfig(config: Config): ResolvedConfig {
       maxCasRetries: config.maxCasRetries,
       tempFileKeep: config.tempFileKeep,
       newline: config.newline,
+      editFormat: config.editFormat,
+      maxEditDrift: config.maxEditDrift,
       prompt: config.prompt,
     }
   }
@@ -244,6 +284,8 @@ function resolveConfig(config: Config): ResolvedConfig {
     maxCasRetries: config.maxCasRetries,
     tempFileKeep: config.tempFileKeep,
     newline: config.newline,
+    editFormat: config.editFormat,
+    maxEditDrift: config.maxEditDrift,
     prompt: config.prompt,
   }
 }
@@ -257,6 +299,7 @@ function assertValidLimits(config: Config): void {
     ['diffLineLimit', config.diffLineLimit],
     ['maxCasRetries', config.maxCasRetries],
     ['tempFileKeep', config.tempFileKeep],
+    ['maxEditDrift', config.maxEditDrift],
   ]
   for (const [field, value] of positiveIntegers) {
     if (!Number.isSafeInteger(value) || value <= 0) {

@@ -35,6 +35,23 @@
   "files": [
     "lib"
   ],
+  "dsh": {
+    "inventory": {
+      "summary": {
+        "zh": "把助手消息中带 file= 的代码块作为一次 Git 事务提交，支持 SEARCH/REPLACE 与 unified diff 两种局部编辑方言。",
+        "en": "Commits fenced code blocks carrying file= as one Git transaction, with SEARCH/REPLACE and unified-diff partial-edit dialects."
+      },
+      "tags": [
+        "filesystem",
+        "git",
+        "editing"
+      ],
+      "dependencies": [
+        "@deepseek-ai/dsh-system-prompt",
+        "@deepseek-ai/dsh-tools"
+      ]
+    }
+  },
   "scripts": {
     "build": "tsdown && tsc --project tsconfig.build.json",
     "check": "pnpm run typecheck && pnpm run test && pnpm run build",

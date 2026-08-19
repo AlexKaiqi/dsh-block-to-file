@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process'
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
@@ -7,9 +7,13 @@ import { parseFileBlocks } from '../src/parser.ts'
 import { commitFileBlocks, fileVersionAt, resolveCanonicalRevision } from '../src/transaction.ts'
 import type { ObservedFileProposal, TransactionConfig } from '../src/transaction.ts'
 import { validateFileBlocks } from '../src/validator.ts'
+import type { EditFormat } from '../src/types.ts'
 
 const roots: string[] = []
 const REF = 'refs/heads/agent-canonical'
+
+/** Shared fixture for partial-edit cases. */
+const CLIENT = 'import os\n\ndef connect():\n    timeout = 1\n    return client\n'
 
 function makeRepository(files: Record<string, string> = {}): string {
   const root = mkdtempSync(join(tmpdir(), 'dsh-b2f-transaction-'))
@@ -36,13 +40,14 @@ function gitIdentity(): NodeJS.ProcessEnv {
   }
 }
 
-function proposals(root: string, revision: string, text: string): ObservedFileProposal[] {
+function proposals(root: string, revision: string, text: string, editFormat?: EditFormat): ObservedFileProposal[] {
   const parsed = parseFileBlocks(text)
   const validation = validateFileBlocks(parsed.blocks, {
     root,
     maxFileSize: 1_048_576,
     maxTotalSize: 2_097_152,
     maxFilesPerMessage: 16,
+    editFormat,
   })
   expect(validation.errors).toEqual([])
   return validation.validated.map(entry => ({
@@ -55,7 +60,7 @@ function proposals(root: string, revision: string, text: string): ObservedFilePr
   }))
 }
 
-function commit(root: string, agentId: string, observedRevision: string, text: string) {
+function commit(root: string, agentId: string, observedRevision: string, text: string, editFormat?: EditFormat) {
   const config: TransactionConfig = {
     root,
     canonicalRef: REF,
@@ -64,8 +69,9 @@ function commit(root: string, agentId: string, observedRevision: string, text: s
     diffLineLimit: 200,
     tempFileKeep: 16,
     maxCasRetries: 8,
+    maxEditDrift: 200,
   }
-  return commitFileBlocks(proposals(root, observedRevision, text), config)
+  return commitFileBlocks(proposals(root, observedRevision, text, editFormat), config)
 }
 
 afterEach(() => {
@@ -241,6 +247,25 @@ describe('Git file transactions', () => {
     expect(report.status).toBe('committed')
   })
 
+  it('refuses to write through a symlinked ancestor directory', () => {
+    const root = makeRepository()
+    const outside = mkdtempSync(join(tmpdir(), 'dsh-b2f-outside-'))
+    roots.push(outside)
+    writeFileSync(join(outside, 'escape.txt'), 'outside\n')
+    symlinkSync(outside, join(root, 'link'), 'dir')
+    const base = resolveCanonicalRevision(root, REF)
+
+    // Caught as worktree drift: the path reads back through the symlink as
+    // content matching neither the observed nor the proposed version, so the
+    // transaction is rejected before publication. `projectRevision`'s
+    // `assertPathInsideRoot` is the second line of defense, never reached here.
+    const report = commit(root, 'agent-a', base, '```text file=link/escape.txt\ninside\n```\n')
+    expect(report.status).toBe('worktree-dirty')
+    expect(report.commit).toBeNull()
+    expect(readFileSync(join(outside, 'escape.txt'), 'utf8')).toBe('outside\n')
+    expect(resolveCanonicalRevision(root, REF)).toBe(base)
+  })
+
   it('preserves executable mode in the commit and worktree projection', () => {
     const root = makeRepository({ 'run.sh': '#!/bin/sh\necho old\n' })
     chmodSync(join(root, 'run.sh'), 0o755)
@@ -252,5 +277,181 @@ describe('Git file transactions', () => {
     expect(report.status).toBe('committed')
     expect(execFileSync('git', ['ls-tree', REF, '--', 'run.sh'], { cwd: root, encoding: 'utf8' })).toMatch(/^100755 /)
     expect(statSync(join(root, 'run.sh')).mode & 0o777).toBe(0o755)
+  })
+
+  it('applies a mode=diff hunk against the observed blob', () => {
+    const root = makeRepository({ 'src/client.py': CLIENT })
+    const base = resolveCanonicalRevision(root, REF)
+
+    const report = commit(
+      root,
+      'agent-a',
+      base,
+      '```python file=src/client.py mode=diff\n'
+      + '@@ -3,3 +3,4 @@\n def connect():\n-    timeout = 1\n+    timeout = 3\n+    retries = 5\n     return client\n'
+      + '```\n',
+      'git_diff',
+    )
+
+    expect(report.status).toBe('committed')
+    if (report.status !== 'committed') return
+    expect(report.results[0]).toMatchObject({
+      status: 'updated',
+      editFormat: 'git_diff',
+      editsProposed: 1,
+      editsApplied: 1,
+      fuzz: 0,
+    })
+    expect(readFileSync(join(root, 'src/client.py'), 'utf8')).toBe(
+      'import os\n\ndef connect():\n    timeout = 3\n    retries = 5\n    return client\n',
+    )
+  })
+
+  it('applies a mode=edit SEARCH/REPLACE block against the observed blob', () => {
+    const root = makeRepository({ 'src/client.py': CLIENT })
+    const base = resolveCanonicalRevision(root, REF)
+
+    const report = commit(
+      root,
+      'agent-a',
+      base,
+      '```python file=src/client.py mode=edit\n'
+      + '<<<<<<< SEARCH\n    timeout = 1\n=======\n    timeout = 3\n>>>>>>> REPLACE\n'
+      + '```\n',
+      'replace',
+    )
+
+    expect(report.status).toBe('committed')
+    if (report.status !== 'committed') return
+    expect(report.results[0]).toMatchObject({ status: 'updated', editFormat: 'replace', editsApplied: 1 })
+    expect(readFileSync(join(root, 'src/client.py'), 'utf8')).toBe(
+      'import os\n\ndef connect():\n    timeout = 3\n    return client\n',
+    )
+  })
+
+  it('reports a bad anchor as edit-unresolved without committing', () => {
+    const root = makeRepository({ 'src/client.py': CLIENT })
+    const base = resolveCanonicalRevision(root, REF)
+
+    const report = commit(
+      root,
+      'agent-a',
+      base,
+      '```python file=src/client.py mode=edit\n'
+      + '<<<<<<< SEARCH\n    timeout = 99\n=======\n    timeout = 3\n>>>>>>> REPLACE\n'
+      + '```\n',
+      'replace',
+    )
+
+    expect(report.status).toBe('edit-unresolved')
+    if (report.status !== 'edit-unresolved') return
+    expect(report.errors[0]?.code).toBe('EDIT_SEARCH_NOT_FOUND')
+    // The echoed content is the file the model must re-anchor on.
+    expect(report.files[0]).toMatchObject({ path: 'src/client.py', content: CLIENT })
+    expect(readFileSync(join(root, 'src/client.py'), 'utf8')).toBe(CLIENT)
+    expect(resolveCanonicalRevision(root, REF)).toBe(base)
+  })
+
+  it('commits nothing when one edit among several fails to resolve', () => {
+    const root = makeRepository({ 'a.txt': 'a0\n', 'b.txt': 'b0\n' })
+    const base = resolveCanonicalRevision(root, REF)
+
+    const report = commit(
+      root,
+      'agent-a',
+      base,
+      '```text file=a.txt mode=edit\n<<<<<<< SEARCH\na0\n=======\na1\n>>>>>>> REPLACE\n```\n'
+      + '```text file=b.txt mode=edit\n<<<<<<< SEARCH\nNOPE\n=======\nb1\n>>>>>>> REPLACE\n```\n'
+      + '```text file=c.txt\nc0\n```\n',
+      'replace',
+    )
+
+    expect(report.status).toBe('edit-unresolved')
+    // The resolvable edit and the unrelated full-content block are both withheld.
+    expect(readFileSync(join(root, 'a.txt'), 'utf8')).toBe('a0\n')
+    expect(existsSync(join(root, 'c.txt'))).toBe(false)
+    expect(resolveCanonicalRevision(root, REF)).toBe(base)
+  })
+
+  it('prefers stale over edit-unresolved when the file changed underneath', () => {
+    const root = makeRepository({ 'shared.txt': 'original\n' })
+    const base = resolveCanonicalRevision(root, REF)
+    const winner = commit(root, 'agent-b', base, '```text file=shared.txt\nwinner\n```\n')
+    expect(winner.status).toBe('committed')
+
+    // The anchor could never resolve, but staleness is the more useful report:
+    // it hands back fresh content instead of blaming the model's anchor.
+    const report = commit(
+      root,
+      'agent-a',
+      base,
+      '```text file=shared.txt mode=edit\n<<<<<<< SEARCH\nNOPE\n=======\nx\n>>>>>>> REPLACE\n```\n',
+      'replace',
+    )
+    expect(report.status).toBe('stale')
+    if (report.status !== 'stale') return
+    expect(report.staleFiles[0]?.content).toBe('winner\n')
+  })
+
+  it('reports an edit against an absent path as a precondition failure', () => {
+    const root = makeRepository()
+    const base = resolveCanonicalRevision(root, REF)
+
+    const report = commit(
+      root,
+      'agent-a',
+      base,
+      '```text file=missing.txt mode=edit\n<<<<<<< SEARCH\na\n=======\nb\n>>>>>>> REPLACE\n```\n',
+      'replace',
+    )
+    expect(report.status).toBe('precondition-failed')
+    if (report.status !== 'precondition-failed') return
+    expect(report.errors[0]?.code).toBe('FILE_NOT_FOUND')
+  })
+
+  it('reports an edit resolving to identical content as unchanged', () => {
+    const root = makeRepository({ 'same.txt': 'value\n' })
+    const base = resolveCanonicalRevision(root, REF)
+
+    const report = commit(
+      root,
+      'agent-a',
+      base,
+      '```text file=same.txt mode=edit\n<<<<<<< SEARCH\nvalue\n=======\nvalue\n>>>>>>> REPLACE\n```\n',
+      'replace',
+    )
+    expect(report.status).toBe('unchanged')
+    expect(resolveCanonicalRevision(root, REF)).toBe(base)
+  })
+
+  it('preserves executable mode through an edit', () => {
+    const root = makeRepository({ 'run.sh': '#!/bin/sh\necho old\n' })
+    chmodSync(join(root, 'run.sh'), 0o755)
+    execFileSync('git', ['add', 'run.sh'], { cwd: root })
+    execFileSync('git', ['commit', '--quiet', '-m', 'make executable'], { cwd: root, env: gitIdentity() })
+    const base = resolveCanonicalRevision(root, REF)
+
+    const report = commit(
+      root,
+      'agent-a',
+      base,
+      '```bash file=run.sh mode=edit\n<<<<<<< SEARCH\necho old\n=======\necho new\n>>>>>>> REPLACE\n```\n',
+      'replace',
+    )
+    expect(report.status).toBe('committed')
+    expect(execFileSync('git', ['ls-tree', REF, '--', 'run.sh'], { cwd: root, encoding: 'utf8' })).toMatch(/^100755 /)
+    expect(statSync(join(root, 'run.sh')).mode & 0o777).toBe(0o755)
+    expect(readFileSync(join(root, 'run.sh'), 'utf8')).toBe('#!/bin/sh\necho new\n')
+  })
+
+  it('rejects the inactive edit mode before touching the repository', () => {
+    const root = makeRepository({ 'src/client.py': CLIENT })
+    const validation = validateFileBlocks(
+      parseFileBlocks('```python file=src/client.py mode=edit\n<<<<<<< SEARCH\na\n=======\nb\n>>>>>>> REPLACE\n```\n').blocks,
+      { root, maxFileSize: 1_048_576, maxTotalSize: 2_097_152, maxFilesPerMessage: 16, editFormat: 'git_diff' },
+    )
+    expect(validation.valid).toBe(false)
+    expect(validation.errors[0]?.code).toBe('EDIT_MODE_DISABLED')
+    expect(validation.errors[0]?.hint).toContain('mode=diff')
   })
 })

@@ -5,6 +5,7 @@
 
 import type {
   B2FCommittedReport,
+  B2FEditUnresolvedReport,
   B2FError,
   B2FFailedReport,
   B2FPreconditionFailedReport,
@@ -60,19 +61,13 @@ export function renderFailureFeedback(report: B2FFailedReport): string {
 }
 
 /** Render operation existence failures separately from concurrent changes. */
-export function renderPreconditionFailureFeedback(report: B2FPreconditionFailedReport): string {
+export function renderPreconditionFailureFeedback(report: B2FPreconditionFailedReport, numbered = false): string {
   const lines = [
     renderErrors('[b2f] precondition failed; nothing was committed.', report.errors),
     `repoRevision: ${report.repoRevision}`,
   ]
   for (const file of report.files) {
-    lines.push('', `${file.path} currentVersion: ${file.fileVersion}`)
-    if (file.content === null) {
-      lines.push('<file is absent>')
-    } else {
-      const fence = safeFence(file.content)
-      lines.push(`${fence} file=${file.path}`, file.content, fence)
-    }
+    lines.push('', `${file.path} currentVersion: ${file.fileVersion}`, ...renderEcho(file.path, file.content, numbered))
   }
   return lines.join('\n')
 }
@@ -86,19 +81,19 @@ function renderErrors(prefix: string, errors: readonly B2FError[]): string {
 }
 
 /** Render stale files as complete new observations for immediate model retry. */
-export function renderStaleFeedback(report: B2FStaleReport): string {
+export function renderStaleFeedback(report: B2FStaleReport, numbered = false): string {
   const lines = [
     '[b2f] stale: transaction rejected; nothing was committed.',
     `repoRevision: ${report.repoRevision}`,
   ]
   for (const file of report.staleFiles) {
-    lines.push('', `${file.path} changed since your observation.`, `observedVersion: ${file.observedVersion}`, `fileVersion: ${file.fileVersion}`)
-    if (file.content === null) {
-      lines.push('<file is absent>')
-    } else {
-      const fence = safeFence(file.content)
-      lines.push(`${fence} file=${file.path}`, file.content, fence)
-    }
+    lines.push(
+      '',
+      `${file.path} changed since your observation.`,
+      `observedVersion: ${file.observedVersion}`,
+      `fileVersion: ${file.fileVersion}`,
+      ...renderEcho(file.path, file.content, numbered),
+    )
     if (file.changesSinceRead.length > 0) {
       lines.push('', 'Changes since observation:')
       for (const change of file.changesSinceRead) {
@@ -111,7 +106,7 @@ export function renderStaleFeedback(report: B2FStaleReport): string {
 }
 
 /** Render local filesystem drift that would otherwise be overwritten. */
-export function renderWorktreeDirtyFeedback(report: B2FWorktreeDirtyReport): string {
+export function renderWorktreeDirtyFeedback(report: B2FWorktreeDirtyReport, numbered = false): string {
   const lines = [
     '[b2f] worktree dirty: transaction rejected; nothing was committed.',
     `repoRevision: ${report.repoRevision}`,
@@ -125,11 +120,10 @@ export function renderWorktreeDirtyFeedback(report: B2FWorktreeDirtyReport): str
       `targetVersion: ${file.targetVersion}`,
       `worktreeVersion: ${file.fileVersion}`,
     )
-    if (file.content === null) {
-      lines.push(file.fileVersion === 'absent' ? '<file is absent>' : '<path is not a regular file>')
+    if (file.content === null && file.fileVersion !== 'absent') {
+      lines.push('<path is not a regular file>')
     } else {
-      const fence = safeFence(file.content)
-      lines.push(`${fence} file=${file.path}`, file.content, fence)
+      lines.push(...renderEcho(file.path, file.content, numbered))
     }
   }
   return lines.join('\n')
@@ -140,13 +134,55 @@ export function renderProjectionFailureFeedback(report: B2FProjectionFailedRepor
   return `[b2f] projection failed at canonical revision ${report.repoRevision}; tool execution is blocked.\n${detail}`
 }
 
-export function renderFeedback(report: B2FReport): string {
+/**
+ * Render one content echo as an INERT block.
+ *
+ * Echoes use `path=`, not `file=`: the parser keeps only blocks carrying `file=`
+ * (`parser.ts`), so a model that copies an echo back verbatim writes nothing and
+ * raises no error. With `file=` a copied-back numbered window would be written
+ * to disk complete with its line-number prefixes.
+ *
+ * @param path - the file this content belongs to.
+ * @param content - current file content, or null when the path is absent.
+ * @param numbered - prefix each line with its 1-based number, matching the read
+ *   tool's `N: text` shape so line-anchored dialects can reuse the numbers.
+ */
+function renderEcho(path: string, content: string | null, numbered = false): string[] {
+  if (content === null) return ['<file is absent>']
+  const body = numbered ? numberLines(content) : content
+  const fence = safeFence(body)
+  return [`${fence} path=${path}${numbered ? ' numbered' : ''}`, body, fence]
+}
+
+/** Prefix every line with its 1-based number, as the read tool renders content. */
+function numberLines(content: string): string {
+  const lines = content.split('\n')
+  // A trailing newline yields a final empty element that is not a line.
+  if (lines[lines.length - 1] === '') lines.pop()
+  return lines.map((line, index) => `${index + 1}: ${line}`).join('\n')
+}
+
+/** Render an unresolved edit with the current content the model should re-anchor on. */
+export function renderEditUnresolvedFeedback(report: B2FEditUnresolvedReport, numbered: boolean): string {
+  const lines = [
+    renderErrors('[b2f] edit not applied; nothing was committed.', report.errors),
+    `repoRevision: ${report.repoRevision}`,
+    'The file is unchanged and current. Re-anchor your edit on the content below.',
+  ]
+  for (const file of report.files) {
+    lines.push('', `${file.path} currentVersion: ${file.fileVersion}`, ...renderEcho(file.path, file.content, numbered))
+  }
+  return lines.join('\n')
+}
+
+export function renderFeedback(report: B2FReport, numbered = false): string {
   switch (report.status) {
     case 'committed': return renderSuccessFeedback(report)
     case 'unchanged': return renderUnchangedFeedback(report)
-    case 'stale': return renderStaleFeedback(report)
-    case 'precondition-failed': return renderPreconditionFailureFeedback(report)
-    case 'worktree-dirty': return renderWorktreeDirtyFeedback(report)
+    case 'stale': return renderStaleFeedback(report, numbered)
+    case 'precondition-failed': return renderPreconditionFailureFeedback(report, numbered)
+    case 'worktree-dirty': return renderWorktreeDirtyFeedback(report, numbered)
+    case 'edit-unresolved': return renderEditUnresolvedFeedback(report, numbered)
     case 'failed': return renderFailureFeedback(report)
     case 'projection-failed': return renderProjectionFailureFeedback(report)
   }

@@ -1,6 +1,6 @@
 /* oxlint-disable typescript/no-unsafe-assignment -- Vitest asymmetric matchers are typed as any. */
 import { execFileSync } from 'node:child_process'
-import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
@@ -13,6 +13,7 @@ import type { UserMessage } from '@deepseek-ai/dsh-session'
 import AgentRegistry from '@deepseek-ai/dsh-agent'
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
 import ToolRuntime, { defineTool } from '@deepseek-ai/dsh-tools'
+import { parseFileBlocks } from '../src/parser.ts'
 import * as BlockToFile from '../src/index.ts'
 
 const contexts: Context[] = []
@@ -78,6 +79,39 @@ async function setup(root: string, config: Partial<BlockToFile.Config> = {}) {
 
 function textBlock(text: string): ContentBlock {
   return { type: 'text', text }
+}
+
+/** Git identity for fixture commits made outside the plugin. */
+function gitEnv(): NodeJS.ProcessEnv {
+  return {
+    ...process.env,
+    GIT_AUTHOR_NAME: 'test',
+    GIT_AUTHOR_EMAIL: 'test@example.com',
+    GIT_COMMITTER_NAME: 'test',
+    GIT_COMMITTER_EMAIL: 'test@example.com',
+  }
+}
+
+/** Append a one-text-block assistant message, the event b2f reacts to. */
+function appendAssistant(agent: Agent, id: string, text: string, turn = 1, step = 1): void {
+  agent.session.append('assistant/message', {
+    turn,
+    step,
+    message: {
+      id: MessageId(id),
+      role: 'assistant',
+      content: [textBlock(text)],
+      source: { kind: 'model', provider: 'test', model: 'test' },
+    },
+  }, { surfaceOp: 'append' })
+}
+
+/** Concatenated text of an injected `[b2f]` feedback message. */
+function feedbackText(message: UserMessage): string {
+  return message.content
+    .filter((block): block is Extract<ContentBlock, { type: 'text' }> => block.type === 'text')
+    .map(block => block.text)
+    .join('')
 }
 
 describe('block-to-file plugin', () => {
@@ -305,5 +339,126 @@ describe('block-to-file plugin', () => {
     const assembly = await ctx.systemPrompt.assemble()
     const text = assembly.sections.map(section => section.text).join('\n')
     expect(text).toContain('file=<relative-path>')
+  })
+
+  it('exposes only the active edit dialect in the assembled prompt', async () => {
+    const gitDiff = await setup(makeRoot(), { editFormat: 'git_diff' })
+    const gitDiffText = (await gitDiff.systemPrompt.assemble()).sections.map(section => section.text).join('\n')
+    expect(gitDiffText).toContain('mode=diff')
+    expect(gitDiffText).not.toContain('<<<<<<< SEARCH')
+
+    const replace = await setup(makeRoot(), { editFormat: 'replace' })
+    const replaceText = (await replace.systemPrompt.assemble()).sections.map(section => section.text).join('\n')
+    expect(replaceText).toContain('<<<<<<< SEARCH')
+    expect(replaceText).not.toContain('mode=diff')
+
+    const none = await setup(makeRoot(), { editFormat: 'none' })
+    const noneText = (await none.systemPrompt.assemble()).sections.map(section => section.text).join('\n')
+    expect(noneText).not.toContain('<<<<<<< SEARCH')
+    expect(noneText).not.toContain('mode=diff')
+    expect(noneText).toContain('file=<relative-path>')
+  })
+
+  it('applies a partial edit end to end through the plugin', async () => {
+    const root = makeRoot()
+    writeFileSync(join(root, 'client.py'), 'timeout = 1\nretries = 0\n')
+    execFileSync('git', ['add', '--all'], { cwd: root })
+    execFileSync('git', ['commit', '--quiet', '-m', 'seed'], { cwd: root, env: gitEnv() })
+
+    const ctx = await setup(root, { editFormat: 'replace' })
+    const injected: UserMessage[] = []
+    const agent = makeAgent(ctx, 'b2f-plugin-edit', root, message => injected.push(message))
+
+    appendAssistant(agent, 'msg-edit', '```python file=client.py mode=edit\n<<<<<<< SEARCH\ntimeout = 1\n=======\ntimeout = 3\n>>>>>>> REPLACE\n```\n')
+    await Promise.resolve()
+
+    expect(readFileSync(join(root, 'client.py'), 'utf8')).toBe('timeout = 3\nretries = 0\n')
+    expect(injected[0]!.content).toEqual([{ type: 'text', text: expect.stringContaining('[b2f] committed') }])
+  })
+
+  it('rejects the inactive edit mode without writing', async () => {
+    const root = makeRoot()
+    writeFileSync(join(root, 'client.py'), 'timeout = 1\n')
+    execFileSync('git', ['add', '--all'], { cwd: root })
+    execFileSync('git', ['commit', '--quiet', '-m', 'seed'], { cwd: root, env: gitEnv() })
+
+    const ctx = await setup(root, { editFormat: 'git_diff' })
+    const injected: UserMessage[] = []
+    const agent = makeAgent(ctx, 'b2f-plugin-wrong-mode', root, message => injected.push(message))
+
+    appendAssistant(agent, 'msg-wrong', '```python file=client.py mode=edit\n<<<<<<< SEARCH\ntimeout = 1\n=======\ntimeout = 3\n>>>>>>> REPLACE\n```\n')
+    await Promise.resolve()
+
+    expect(readFileSync(join(root, 'client.py'), 'utf8')).toBe('timeout = 1\n')
+    expect(injected[0]!.content).toEqual([{ type: 'text', text: expect.stringContaining('EDIT_MODE_DISABLED') }])
+  })
+
+  it('returns the current content for re-anchoring when an edit does not resolve', async () => {
+    const root = makeRoot()
+    writeFileSync(join(root, 'client.py'), 'timeout = 1\n')
+    execFileSync('git', ['add', '--all'], { cwd: root })
+    execFileSync('git', ['commit', '--quiet', '-m', 'seed'], { cwd: root, env: gitEnv() })
+
+    const ctx = await setup(root, { editFormat: 'replace' })
+    const injected: UserMessage[] = []
+    const agent = makeAgent(ctx, 'b2f-plugin-unresolved', root, message => injected.push(message))
+
+    appendAssistant(agent, 'msg-unresolved', '```python file=client.py mode=edit\n<<<<<<< SEARCH\nNOPE\n=======\nx\n>>>>>>> REPLACE\n```\n')
+    await Promise.resolve()
+
+    expect(readFileSync(join(root, 'client.py'), 'utf8')).toBe('timeout = 1\n')
+    const text = feedbackText(injected[0]!)
+    expect(text).toContain('[b2f] edit not applied')
+    expect(text).toContain('EDIT_SEARCH_NOT_FOUND')
+    // The echo is inert: `path=` is not a write instruction.
+    expect(text).toContain('path=client.py')
+    expect(parseFileBlocks(text).blocks).toEqual([])
+  })
+
+  it('emits b2f/transaction with per-block edit metrics', async () => {
+    const root = makeRoot()
+    writeFileSync(join(root, 'client.py'), 'timeout = 1\n')
+    execFileSync('git', ['add', '--all'], { cwd: root })
+    execFileSync('git', ['commit', '--quiet', '-m', 'seed'], { cwd: root, env: gitEnv() })
+
+    const ctx = await setup(root, { editFormat: 'replace' })
+    const reports: BlockToFile.B2FReport[] = []
+    ctx.on('b2f/transaction', (_session, report) => {
+      reports.push(report)
+    })
+    const agent = makeAgent(ctx, 'b2f-plugin-metrics', root, () => {})
+
+    appendAssistant(agent, 'msg-metrics', '```python file=client.py mode=edit\n<<<<<<< SEARCH\ntimeout = 1\n=======\ntimeout = 3\n>>>>>>> REPLACE\n```\n')
+    await Promise.resolve()
+
+    expect(reports).toHaveLength(1)
+    expect(reports[0]?.status).toBe('committed')
+    expect(reports[0]?.results[0]).toMatchObject({
+      editFormat: 'replace',
+      editsProposed: 1,
+      editsApplied: 1,
+      fuzz: 0,
+    })
+  })
+
+  it('numbers echoed content only for the line-anchored dialect', async () => {
+    for (const [editFormat, expectNumbered] of [['git_diff', true], ['replace', false]] as const) {
+      const root = makeRoot()
+      writeFileSync(join(root, 'client.py'), 'alpha\nbeta\n')
+      execFileSync('git', ['add', '--all'], { cwd: root })
+      execFileSync('git', ['commit', '--quiet', '-m', 'seed'], { cwd: root, env: gitEnv() })
+
+      const ctx = await setup(root, { editFormat })
+      const injected: UserMessage[] = []
+      const agent = makeAgent(ctx, `b2f-plugin-numbered-${editFormat}`, root, message => injected.push(message))
+
+      // mode=create on an existing path fails its precondition and echoes content.
+      appendAssistant(agent, `msg-numbered-${editFormat}`, '```python file=client.py mode=create\nx\n```\n')
+      await Promise.resolve()
+
+      const text = feedbackText(injected[0]!)
+      expect(text).toContain('FILE_EXISTS')
+      expect(text.includes('1: alpha')).toBe(expectNumbered)
+    }
   })
 })

@@ -90,6 +90,7 @@ function buildBlock(parsed: ParsedInfo, rawPath: string, content: string, defaul
     diff: parsed.attrs.get('diff') ?? 'limited',
     encoding: parsed.attrs.get('encoding') ?? 'utf-8',
     newline: parsed.attrs.get('newline') ?? defaultNewline,
+    newlineExplicit: parsed.attrs.has('newline'),
     lang: parsed.lang,
     index,
   }

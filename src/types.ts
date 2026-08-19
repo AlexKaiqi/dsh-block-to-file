@@ -4,7 +4,24 @@
  */
 
 /** Valid block materialization modes. */
-export type FileBlockMode = 'write' | 'create' | 'update' | 'append' | 'delete'
+export type FileBlockMode = 'write' | 'create' | 'update' | 'append' | 'delete' | 'edit' | 'diff'
+
+/**
+ * Which partial-edit dialect is exposed to the model.
+ *
+ * Exactly one is active per deployment so the model never has to choose a patch
+ * format; the inactive edit mode is rejected with a corrective error.
+ * - `replace`: `mode=edit`, SEARCH/REPLACE blocks anchored on content.
+ * - `git_diff`: `mode=diff`, hunk-only unified diff anchored on line + context.
+ * - `none`: no partial edits; full-content blocks only.
+ */
+export type EditFormat = 'replace' | 'git_diff' | 'none'
+
+/** The block mode each edit dialect accepts. */
+export const EDIT_MODE_FOR_FORMAT = {
+  replace: 'edit',
+  git_diff: 'diff',
+} as const satisfies Record<Exclude<EditFormat, 'none'>, FileBlockMode>
 
 /** Valid diff feedback strategies. */
 export type FileBlockDiff = 'full' | 'limited' | 'stats' | 'none'
@@ -29,6 +46,12 @@ export interface FileBlock {
   readonly encoding: string
   /** Raw `newline=` attribute value, validated later. */
   readonly newline: string
+  /**
+   * True when the block itself carried `newline=`, as opposed to inheriting the
+   * deployment default. Edit modes reject an explicit value but must tolerate
+   * the inherited one.
+   */
+  readonly newlineExplicit: boolean
   /** Language tag from the info string, when present; informational only. */
   readonly lang: string | null
   /** Zero-based occurrence order within the assistant message. */
@@ -64,6 +87,14 @@ export type B2FErrorCode =
   | 'DELETE_CONTENT'
   | 'FILE_EXISTS'
   | 'FILE_NOT_FOUND'
+  | 'EDIT_MODE_DISABLED'
+  | 'EDIT_EMPTY'
+  | 'EDIT_NEWLINE_ATTR'
+  | 'EDIT_MALFORMED'
+  | 'EDIT_SEARCH_NOT_FOUND'
+  | 'EDIT_SEARCH_AMBIGUOUS'
+  | 'EDIT_SPAN_OVERLAP'
+  | 'EDIT_CONTEXT_MISMATCH'
   | 'MATERIALIZE_FAILED'
 
 /** One actionable validation, precondition, or materialization failure. */
@@ -86,6 +117,18 @@ export interface MaterializeResult {
   readonly added: number
   readonly removed: number
   readonly diffText: string | null
+  /** Dialect that resolved this block, or null for a full-content block. */
+  readonly editFormat: Exclude<EditFormat, 'none'> | null
+  /** Edits the block proposed; 0 for a full-content block. */
+  readonly editsProposed: number
+  /** Edits successfully applied; equals `editsProposed` on success. */
+  readonly editsApplied: number
+  /**
+   * Largest line drift between a hunk's stated and matched anchor. Always 0 for
+   * `replace` (content anchors do not drift) and for full-content blocks; the
+   * direct measure of how much line movement `git_diff` absorbed.
+   */
+  readonly fuzz: number
 }
 
 /** Commit metadata explaining one canonical change since an observation. */
@@ -178,6 +221,24 @@ export interface B2FWorktreeDirtyReport {
   readonly dirtyFiles: readonly DirtyFile[]
 }
 
+/**
+ * No proposal was committed because an edit block's anchors did not resolve.
+ *
+ * Reported only after the staleness check passes, so the echoed content IS the
+ * current canonical content and the failure is unambiguously the model's to fix.
+ */
+export interface B2FEditUnresolvedReport {
+  readonly status: 'edit-unresolved'
+  readonly ok: false
+  readonly commit: null
+  readonly repoRevision: string
+  readonly results: readonly []
+  readonly errors: readonly B2FError[]
+  readonly staleFiles: readonly []
+  /** Current content of each path whose edit failed, for an immediate retry. */
+  readonly files: readonly PreconditionFile[]
+}
+
 /** Parsing, validation, or pre-publication repository failure. */
 export interface B2FFailedReport {
   readonly status: 'failed'
@@ -207,6 +268,7 @@ export type B2FReport =
   | B2FStaleReport
   | B2FPreconditionFailedReport
   | B2FWorktreeDirtyReport
+  | B2FEditUnresolvedReport
   | B2FFailedReport
   | B2FProjectionFailedReport
 
@@ -227,7 +289,7 @@ export const ERROR_HINTS: Record<B2FErrorCode, string> = {
   SIZE_EXCEEDED: 'split the file into smaller files or reduce its content',
   TOTAL_SIZE_EXCEEDED: 'split the content across multiple assistant messages',
   TOO_MANY_FILES: 'split the file blocks across multiple assistant messages',
-  INVALID_MODE: 'use one of mode=write, mode=create, mode=update, mode=append, or mode=delete',
+  INVALID_MODE: 'use one of mode=write, mode=create, mode=update, mode=append, mode=delete, or the edit mode named in the b2f instructions',
   INVALID_DIFF: 'use one of diff=full, diff=limited, diff=stats, or diff=none',
   INVALID_ENCODING: 'omit the encoding attribute (only utf-8 is supported)',
   INVALID_NEWLINE: 'use one of newline=preserve, newline=lf, or newline=crlf',
@@ -237,5 +299,13 @@ export const ERROR_HINTS: Record<B2FErrorCode, string> = {
   DELETE_CONTENT: 'mode=delete requires an empty fenced block',
   FILE_EXISTS: 'mode=create requires the target to be absent; use mode=update or mode=write after reviewing it',
   FILE_NOT_FOUND: 'mode=update requires an existing file; use mode=create or mode=write after checking the path',
+  EDIT_MODE_DISABLED: 'this deployment exposes a different edit format; see the b2f instructions for the mode to use',
+  EDIT_EMPTY: 'an edit block must contain at least one edit',
+  EDIT_NEWLINE_ATTR: 'omit newline= on an edit block; edits preserve the file\'s existing line endings',
+  EDIT_MALFORMED: 'fix the edit block syntax and re-emit it',
+  EDIT_SEARCH_NOT_FOUND: 'copy the text to change verbatim from the file, including indentation',
+  EDIT_SEARCH_AMBIGUOUS: 'extend the SEARCH block with surrounding lines until it identifies one location',
+  EDIT_SPAN_OVERLAP: 'merge the overlapping edits into one, or target distinct regions',
+  EDIT_CONTEXT_MISMATCH: 'recheck the line numbers and context lines against the file content shown below',
   MATERIALIZE_FAILED: 'retry the operation, or check repository state, disk space, and permissions',
 }
