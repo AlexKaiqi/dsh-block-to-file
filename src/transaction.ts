@@ -7,6 +7,7 @@ import {
   lstatSync,
   mkdirSync,
   openSync,
+  readdirSync,
   readFileSync,
   readlinkSync,
   realpathSync,
@@ -19,7 +20,7 @@ import { dirname, isAbsolute, join, relative, sep } from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { countDiffStats, unifiedDiff } from './diff.ts'
 import { editError, resolveEdit } from './edit.ts'
-import { resolveTempDir, sweepTempDir } from './materializer.ts'
+import { assertTempDirOutsideRoot, resolveGitDir, resolveTempDir, sweepTempDir } from './materializer.ts'
 import { ERROR_HINTS } from './types.ts'
 import type { ValidatedFileBlock } from './validator.ts'
 import type {
@@ -80,24 +81,34 @@ interface WorktreeEntry {
   readonly content: string | null
 }
 
-/** Resolve the current canonical commit, initializing the ref from HEAD once. */
+interface SnapshotEntry {
+  readonly path: string
+  readonly mode: '100644' | '100755' | '120000'
+}
+
+const BOOTSTRAP_REF = 'refs/b2f/bootstrap'
+const ZERO_OID = '0000000000000000000000000000000000000000'
+const readyGitDirs = new Set<string>()
+
+/** Resolve the current canonical commit, initializing the ref from the managed baseline once. */
 export function resolveCanonicalRevision(root: string, canonicalRef: string): string {
-  assertGitRoot(root)
+  ensureManagedRepository(root)
   const current = tryGit(root, ['rev-parse', '--verify', canonicalRef])
   if (current !== null) return current.trim()
-  const head = git(root, ['rev-parse', '--verify', 'HEAD']).trim()
-  tryGit(root, ['update-ref', canonicalRef, head, '0000000000000000000000000000000000000000'])
+  const head = git(root, ['rev-parse', '--verify', BOOTSTRAP_REF]).trim()
+  tryGit(root, ['update-ref', canonicalRef, head, ZERO_OID])
   return git(root, ['rev-parse', '--verify', canonicalRef]).trim()
 }
 
-/** Resolve the worktree's Git HEAD, used as the initial projection baseline. */
+/** Resolve the plugin-owned baseline used as the initial projection revision. */
 export function resolveWorktreeRevision(root: string): string {
-  assertGitRoot(root)
-  return git(root, ['rev-parse', '--verify', 'HEAD']).trim()
+  ensureManagedRepository(root)
+  return git(root, ['rev-parse', '--verify', BOOTSTRAP_REF]).trim()
 }
 
 /** Return the blob identity for a path at one repository revision. */
 export function fileVersionAt(root: string, revision: string, path: string): FileVersion {
+  ensureManagedRepository(root)
   return treeEntryAt(root, revision, path).version
 }
 
@@ -107,6 +118,7 @@ export function commitFileBlocks(
   config: TransactionConfig,
 ): B2FReport {
   try {
+    ensureManagedRepository(config.root)
     const candidates = proposals.map(proposal => buildCandidate(proposal, config))
 
     for (let attempt = 0; attempt < config.maxCasRetries; attempt++) {
@@ -505,12 +517,7 @@ function readWorktreeEntry(root: string, path: string): WorktreeEntry {
 }
 
 function hashBuffer(root: string, buffer: Buffer): string {
-  return execFileSync('git', ['hash-object', '--stdin'], {
-    cwd: root,
-    encoding: 'utf8',
-    input: buffer,
-    stdio: ['pipe', 'pipe', 'pipe'],
-  }).trim()
+  return git(root, ['hash-object', '--stdin'], buffer).trim()
 }
 
 function createCommit(root: string, tree: string, parent: string, agentId: string, paths: readonly string[]): string {
@@ -569,12 +576,14 @@ function readBlobBuffer(root: string, oid: string): Buffer {
   return execFileSync('git', ['cat-file', 'blob', oid], {
     cwd: root,
     encoding: 'buffer',
+    env: managedGitEnv(root),
     stdio: ['ignore', 'pipe', 'pipe'],
   })
 }
 
 /** Project the complete canonical delta so the agent worktree matches its new revision. */
 export function projectRevision(root: string, fromRevision: string, toRevision: string, tempFileKeep: number): void {
+  ensureManagedRepository(root)
   if (fromRevision === toRevision) return
   const output = git(root, ['diff', '--name-only', '--no-renames', '-z', fromRevision, toRevision])
   const paths = output.split('\0').filter(path => path.length > 0)
@@ -631,13 +640,6 @@ function assertPathInsideRoot(targetPath: string, root: string): void {
   }
 }
 
-function assertGitRoot(root: string): void {
-  const top = git(root, ['rev-parse', '--show-toplevel']).trim()
-  if (realpathSync(top) !== realpathSync(root)) {
-    throw new Error(`block-to-file: root must be the Git worktree root (got ${root}, repository root is ${top})`)
-  }
-}
-
 function convertNewlines(content: string, newline: FileBlockNewline): string {
   if (newline === 'lf') return content.replace(/\r\n/g, '\n').replace(/\r/g, '\n')
   if (newline === 'crlf') return content.replace(/\r\n/g, '\n').replace(/\r/g, '\n').replace(/\n/g, '\r\n')
@@ -663,11 +665,11 @@ function isNodeError(error: unknown): error is NodeJS.ErrnoException {
   return error instanceof Error && 'code' in error
 }
 
-function git(root: string, args: readonly string[], input?: string, env: NodeJS.ProcessEnv = process.env): string {
+function git(root: string, args: readonly string[], input?: string | Buffer, env: NodeJS.ProcessEnv = process.env): string {
   return execFileSync('git', [...args], {
     cwd: root,
     encoding: 'utf8',
-    env,
+    env: managedGitEnv(root, env),
     input,
     stdio: ['pipe', 'pipe', 'pipe'],
   })
@@ -678,5 +680,161 @@ function tryGit(root: string, args: readonly string[]): string | null {
     return git(root, args)
   } catch {
     return null
+  }
+}
+
+/** Ensure the workspace has an isolated object database without creating `<root>/.git`. */
+function ensureManagedRepository(root: string): void {
+  if (!isAbsolute(root)) throw new Error(`block-to-file: root must be absolute (got ${root})`)
+  mkdirSync(root, { recursive: true })
+  const gitDir = resolveGitDir(root)
+  assertTempDirOutsideRoot(gitDir, root)
+  if (readyGitDirs.has(gitDir) && existsSync(join(gitDir, 'HEAD'))) return
+
+  mkdirSync(dirname(gitDir), { recursive: true })
+  if (!existsSync(join(gitDir, 'HEAD'))) {
+    execFileSync('git', ['init', '--bare', '--quiet', gitDir], {
+      cwd: root,
+      env: sourceGitEnv(),
+      stdio: ['ignore', 'pipe', 'pipe'],
+    })
+  }
+
+  const existing = tryGit(root, ['rev-parse', '--verify', BOOTSTRAP_REF])
+  if (existing === null) {
+    const tree = snapshotWorkspaceTree(root)
+    const env = gitIdentityEnv()
+    const commit = git(root, ['commit-tree', tree], 'b2f: bootstrap workspace\n', env).trim()
+    tryGit(root, ['update-ref', BOOTSTRAP_REF, commit, ZERO_OID])
+    git(root, ['rev-parse', '--verify', BOOTSTRAP_REF])
+  }
+  readyGitDirs.add(gitDir)
+}
+
+/** Capture the current workspace without descending into nested `.git` stores. */
+function snapshotWorkspaceTree(root: string): string {
+  const entries = collectSnapshotEntries(root)
+  const indexPath = join(resolveTempDir(root), `bootstrap-index-${process.pid}-${randomUUID()}`)
+  mkdirSync(dirname(indexPath), { recursive: true })
+  const env = { ...process.env, GIT_INDEX_FILE: indexPath }
+  try {
+    git(root, ['read-tree', '--empty'], undefined, env)
+    const indexRecords: string[] = []
+    const regular = entries.filter(entry => entry.mode !== '120000')
+    for (let offset = 0; offset < regular.length; offset += 1_000) {
+      const batch = regular.slice(offset, offset + 1_000)
+      const safe: SnapshotEntry[] = []
+      const unsafe: SnapshotEntry[] = []
+      for (const entry of batch) {
+        if (entry.path.includes('\n') || entry.path.includes('\r') || entry.path.startsWith('"')) unsafe.push(entry)
+        else safe.push(entry)
+      }
+      if (safe.length > 0) {
+        const output = git(root, ['hash-object', '-w', '--stdin-paths'], `${safe.map(entry => entry.path).join('\n')}\n`)
+        const oids = output.trimEnd().split('\n')
+        if (oids.length !== safe.length) throw new Error('block-to-file: Git returned an incomplete bootstrap hash list')
+        for (let index = 0; index < safe.length; index++) {
+          indexRecords.push(`${safe[index]!.mode} ${oids[index]!}\t${safe[index]!.path}\0`)
+        }
+      }
+      for (const entry of unsafe) {
+        const oid = git(root, ['hash-object', '-w', '--stdin'], readFileSync(join(root, entry.path))).trim()
+        indexRecords.push(`${entry.mode} ${oid}\t${entry.path}\0`)
+      }
+    }
+    for (const entry of entries.filter(candidate => candidate.mode === '120000')) {
+      const oid = git(root, ['hash-object', '-w', '--stdin'], Buffer.from(readlinkSync(join(root, entry.path)))).trim()
+      indexRecords.push(`${entry.mode} ${oid}\t${entry.path}\0`)
+    }
+    for (let offset = 0; offset < indexRecords.length; offset += 1_000) {
+      git(root, ['update-index', '-z', '--index-info'], indexRecords.slice(offset, offset + 1_000).join(''), env)
+    }
+    return git(root, ['write-tree'], undefined, env).trim()
+  } finally {
+    rmSync(indexPath, { force: true })
+  }
+}
+
+function collectSnapshotEntries(root: string): SnapshotEntry[] {
+  const byPath = new Map<string, SnapshotEntry>()
+
+  const addPath = (absolutePath: string): void => {
+    const stat = lstatSync(absolutePath)
+    if (!stat.isFile() && !stat.isSymbolicLink()) return
+    const path = relative(root, absolutePath).split(sep).join('/')
+    if (path.length === 0) return
+    const mode = stat.isSymbolicLink() ? '120000' : (stat.mode & 0o111) !== 0 ? '100755' : '100644'
+    byPath.set(path, { path, mode })
+  }
+
+  const visit = (directory: string): void => {
+    const gitFiles = listGitWorkspaceFiles(directory)
+    if (gitFiles !== null) {
+      for (const path of gitFiles) {
+        const absolutePath = join(directory, path)
+        if (existsSync(absolutePath)) addPath(absolutePath)
+      }
+      return
+    }
+    for (const entry of readdirSync(directory, { withFileTypes: true })) {
+      if (entry.name === '.git') continue
+      const absolutePath = join(directory, entry.name)
+      if (entry.isDirectory()) visit(absolutePath)
+      else if (entry.isFile() || entry.isSymbolicLink()) addPath(absolutePath)
+    }
+  }
+
+  visit(root)
+  return [...byPath.values()].sort((a, b) => a.path.localeCompare(b.path))
+}
+
+/** Return tracked files when `directory` is itself a Git worktree root. */
+function listGitWorkspaceFiles(directory: string): string[] | null {
+  if (!existsSync(join(directory, '.git'))) return null
+  try {
+    const top = execFileSync('git', ['rev-parse', '--show-toplevel'], {
+      cwd: directory,
+      encoding: 'utf8',
+      env: sourceGitEnv(),
+      stdio: ['ignore', 'pipe', 'pipe'],
+    }).trim()
+    if (realpathSync(top) !== realpathSync(directory)) return null
+    return execFileSync('git', ['ls-files', '--cached', '-z'], {
+      cwd: directory,
+      encoding: 'utf8',
+      env: sourceGitEnv(),
+      stdio: ['ignore', 'pipe', 'pipe'],
+    }).split('\0').filter(path => path.length > 0)
+  } catch {
+    return null
+  }
+}
+
+function managedGitEnv(root: string, base: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { ...base, GIT_DIR: resolveGitDir(root), GIT_WORK_TREE: root }
+  delete env.GIT_COMMON_DIR
+  delete env.GIT_OBJECT_DIRECTORY
+  delete env.GIT_ALTERNATE_OBJECT_DIRECTORIES
+  return env
+}
+
+function sourceGitEnv(): NodeJS.ProcessEnv {
+  const env = { ...process.env }
+  delete env.GIT_DIR
+  delete env.GIT_WORK_TREE
+  delete env.GIT_COMMON_DIR
+  delete env.GIT_INDEX_FILE
+  delete env.GIT_OBJECT_DIRECTORY
+  delete env.GIT_ALTERNATE_OBJECT_DIRECTORIES
+  return env
+}
+
+function gitIdentityEnv(): NodeJS.ProcessEnv {
+  return {
+    ...process.env,
+    GIT_AUTHOR_NAME: process.env.GIT_AUTHOR_NAME ?? 'block-to-file',
+    GIT_AUTHOR_EMAIL: process.env.GIT_AUTHOR_EMAIL ?? 'b2f@localhost',
+    GIT_COMMITTER_NAME: process.env.GIT_COMMITTER_NAME ?? 'block-to-file',
+    GIT_COMMITTER_EMAIL: process.env.GIT_COMMITTER_EMAIL ?? 'b2f@localhost',
   }
 }

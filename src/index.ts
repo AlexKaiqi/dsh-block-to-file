@@ -19,7 +19,7 @@ import type { Session, SessionEvent } from '@deepseek-ai/dsh-session'
 import type { PreToolDecision, ToolExecution } from '@deepseek-ai/dsh-tools'
 import { parseFileBlocks as parseBlocks } from './parser.ts'
 import { validateFileBlocks as validateBlocks } from './validator.ts'
-import { assertTempDirOutsideRoot as assertTmpOutside, resolveTempDir, sweepTempDir } from './materializer.ts'
+import { assertTempDirOutsideRoot as assertTmpOutside, resolveGitDir, resolveTempDir, sweepTempDir } from './materializer.ts'
 import { renderFeedback as renderB2FFeedback } from './feedback.ts'
 import { DEFAULT_MAX_DRIFT } from './edit.ts'
 import { buildPrompt, DEFAULT_PROMPT } from './model/prompt.ts'
@@ -30,7 +30,7 @@ export { parseFileBlocks } from './parser.ts'
 export type { ParseResult } from './parser.ts'
 export { validateFileBlocks } from './validator.ts'
 export type { B2FValidationConfig, ValidatedFileBlock, ValidationResult } from './validator.ts'
-export { assertTempDirOutsideRoot, resolveTempDir, sweepTempDir } from './materializer.ts'
+export { assertTempDirOutsideRoot, resolveGitDir, resolveTempDir, sweepTempDir } from './materializer.ts'
 export { DEFAULT_MAX_DRIFT, editError, resolveEdit } from './edit.ts'
 export type { EditFailure, EditOutcome, EditResolution } from './edit.ts'
 export { b2fError, BlockToFileError, isB2FError } from './errors.ts'
@@ -133,6 +133,7 @@ export function apply(ctx: Context, config: Config): void {
   if (!resolved.enabled) return
   const defaultTmp = resolveTempDir(resolved.root)
   assertTmpOutside(defaultTmp, resolved.root)
+  assertTmpOutside(resolveGitDir(resolved.root), resolved.root)
   sweepTempDir(defaultTmp, resolved.tempFileKeep)
   new B2FServiceClass(ctx, resolved.root)
   const state = new Map<string, StepB2FState>()
@@ -201,7 +202,10 @@ function runPipeline(
   const text = content
     .filter((block): block is Extract<ContentBlock, { type: 'text' }> => block.type === 'text')
     .map(block => block.text)
-    .join('')
+    // Content blocks are semantic boundaries, not streaming chunks. Keep a
+    // line boundary between them so a closing fence at the end of one block
+    // cannot be fused with ordinary reply text in the next block.
+    .join('\n')
 
   const parsed = parseBlocks(text, config.newline)
   if (parsed.blocks.length === 0 && parsed.errors.length === 0) return null

@@ -14,6 +14,7 @@ import AgentRegistry from '@deepseek-ai/dsh-agent'
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
 import ToolRuntime, { defineTool } from '@deepseek-ai/dsh-tools'
 import { parseFileBlocks } from '../src/parser.ts'
+import { resolveGitDir } from '../src/materializer.ts'
 import * as BlockToFile from '../src/index.ts'
 
 const contexts: Context[] = []
@@ -41,7 +42,14 @@ function makeRoot(): string {
     },
   })
   roots.push(root)
-  tempRoots.push(`${root}.b2f-tmp`)
+  tempRoots.push(`${root}.b2f-tmp`, resolveGitDir(root))
+  return root
+}
+
+function makePlainRoot(): string {
+  const root = mkdtempSync(join(tmpdir(), 'dsh-b2f-plain-workspace-'))
+  roots.push(root)
+  tempRoots.push(`${root}.b2f-tmp`, resolveGitDir(root))
   return root
 }
 
@@ -115,6 +123,20 @@ function feedbackText(message: UserMessage): string {
 }
 
 describe('block-to-file plugin', () => {
+  it('works end to end when the workspace has no .git directory', async () => {
+    const root = makePlainRoot()
+    writeFileSync(join(root, 'existing.txt'), 'before\n')
+    const ctx = await setup(root)
+    const agent = makeAgent(ctx, 'b2f-plugin-plain-root', root, () => {})
+
+    appendAssistant(agent, 'msg-plain-root', '```text file=existing.txt\nafter\n```\n')
+    await Promise.resolve()
+
+    expect(readFileSync(join(root, 'existing.txt'), 'utf8')).toBe('after\n')
+    expect(existsSync(join(root, '.git'))).toBe(false)
+    expect(existsSync(join(resolveGitDir(root), 'HEAD'))).toBe(true)
+  })
+
   it('materializes file blocks when an assistant message is appended', async () => {
     const root = makeRoot()
     const ctx = await setup(root)
@@ -136,6 +158,29 @@ describe('block-to-file plugin', () => {
     expect(readFileSync(join(root, 'src/app.py'), 'utf8')).toBe('print("hello")\n')
     expect(injected).toHaveLength(1)
     expect(injected[0]!.content).toEqual([{ type: 'text', text: expect.stringContaining('[b2f] created src/app.py') }])
+  })
+
+  it('does not absorb a following text content block into a file fence', async () => {
+    const root = makeRoot()
+    const ctx = await setup(root)
+    const agent = makeAgent(ctx, 'b2f-plugin-text-boundary', root, () => {})
+
+    agent.session.append('assistant/message', {
+      turn: 1,
+      step: 1,
+      message: {
+        id: MessageId('msg-text-boundary'),
+        role: 'assistant',
+        content: [
+          textBlock('```yaml file=config.yaml\nheader: keep\ntimeout: 5000\nfooter: keep\n```'),
+          textBlock('已发起第二次写入……'),
+        ],
+        source: { kind: 'model', provider: 'test', model: 'test' },
+      },
+    }, { surfaceOp: 'append' })
+    await Promise.resolve()
+
+    expect(readFileSync(join(root, 'config.yaml'), 'utf8')).toBe('header: keep\ntimeout: 5000\nfooter: keep\n')
   })
 
   it('does not materialize on validation failure', async () => {

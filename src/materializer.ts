@@ -20,6 +20,12 @@ export function resolveTempDir(root: string): string {
   return `${normalized}.b2f-tmp`
 }
 
+/** Resolve the plugin-owned bare Git directory; never inside the workspace. */
+export function resolveGitDir(root: string): string {
+  const normalized = root.replace(/[/\\]+$/, '') || root
+  return `${normalized}.b2f-git`
+}
+
 /** Reject a temp dir that would pollute the working tree (root or a descendant). */
 export function assertTempDirOutsideRoot(tmpDir: string, root: string): void {
   const resolvedRoot = resolve(root)
