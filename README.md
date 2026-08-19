@@ -17,9 +17,9 @@ def main():
 ```
 ````
 
-Attributes: `file` (required), `mode=write|create|append` (default `write`),
-`diff=full|limited|stats|none` (default `limited`), `encoding=utf-8`,
-`newline=preserve|lf|crlf`.
+Attributes: `file` (required), `mode=write|create|update|append|delete` (default
+`write`), plus one edit mode (below); `diff=full|limited|stats|none` (default
+`limited`), `encoding=utf-8`, `newline=preserve|lf|crlf`.
 
 `append` is computed from the observed blob and is idempotent: when that blob
 already ends with the block content, b2f reports `[b2f] append skipped`.
@@ -32,11 +32,72 @@ response becomes the agent's new observation for an immediate retry.
 Git index construction and workspace-projection temp files live in
 `<root>.b2f-tmp` (or `$DSH_B2F_TMP`), outside the worktree.
 
+## Partial edits
+
+A partial edit is a front-end only: b2f resolves `(observed blob, patch) → full
+content` and the result travels the same path as any full-content proposal
+(stale comparison, precondition checks, ref CAS, projection, diff feedback).
+Resolution is pure and runs against the exact bytes of the blob the model
+observed — never the worktree and never through `git apply`, so no clean/smudge
+filter, `core.autocrlf`, or `apply.whitespace` setting can alter content on the
+way in.
+
+`editFormat` selects **one** dialect. Only that dialect is described in the
+system prompt and only its mode is accepted, so the model never has to choose
+between patch formats; the other is rejected with `EDIT_MODE_DISABLED`.
+
+`editFormat: replace` — anchors are content:
+
+````markdown
+```python file=src/client.py mode=edit
+<<<<<<< SEARCH
+    timeout = 1
+=======
+    timeout = 3
+    retries = 5
+>>>>>>> REPLACE
+```
+````
+
+Each SEARCH is matched against the observed content and must match **exactly
+once**; spans must not overlap. An empty REPLACE deletes. Insert by keeping the
+anchor lines in both sections. Matching is order-independent, so a failure is
+always attributable to one edit.
+
+`editFormat: git_diff` — anchors are line numbers plus context:
+
+````markdown
+```python file=src/client.py mode=diff
+@@ -40,3 +40,4 @@
+ def connect():
+-    timeout = 1
++    timeout = 3
++    retries = 5
+     return client
+```
+````
+
+Emit hunks only — no `diff --git`, `index`, `---`, or `+++` lines. Stated line
+counts are ignored and recomputed from the body (as `git apply --recount` does),
+and the `@@` start line is a **hint**: the hunk is located by searching outward
+for its context, nearest match winning, up to `maxEditDrift` lines. This
+tolerates the line drift that plain `git apply` cannot recover from.
+
+Both dialects allow several edits per block and preserve the file's existing line
+endings, so `newline=` is rejected on an edit block. When anchors do not resolve,
+nothing commits and feedback returns the current content to re-anchor on.
+
+Content echoed in `[b2f]` feedback is labelled `path=`, not `file=`, so a model
+that copies an echo back verbatim writes nothing. Under `git_diff` those echoes
+are line-numbered to match the `read` tool's format.
+
 ## Configuration
 
 ```yaml
 b2f:
   root: "$WS"                # expands $WS / $DSH_B2F_ROOT; DSH_B2F_ROOT env wins
+  editFormat: git_diff       # git_diff | replace | none
+  maxEditDrift: 200          # lines a mode=diff hunk may drift from its @@ line
   maxFileSize: 1048576
   maxTotalSize: 2097152
   maxFilesPerMessage: 16
@@ -45,6 +106,13 @@ b2f:
   maxCasRetries: 8
   tempFileKeep: 16
 ```
+
+Set `editFormat: none` to disable partial edits entirely.
+
+Each settled transaction is emitted as `b2f/transaction` with the full report.
+Per-block `editFormat`, `editsProposed`, `editsApplied`, and `fuzz` are carried
+on every result, so first-apply success rate, retry counts, and drift tolerance
+can be compared across dialects without this plugin aggregating anything.
 
 `root` must be a Git worktree root with a valid `HEAD` commit. On first use b2f
 creates `canonicalRef` from `HEAD`; after that the canonical ref is the only

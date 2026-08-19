@@ -18,6 +18,7 @@ import {
 import { dirname, isAbsolute, join, relative, sep } from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { countDiffStats, unifiedDiff } from './diff.ts'
+import { editError, resolveEdit } from './edit.ts'
 import { resolveTempDir, sweepTempDir } from './materializer.ts'
 import { ERROR_HINTS } from './types.ts'
 import type { ValidatedFileBlock } from './validator.ts'
@@ -26,6 +27,7 @@ import type {
   B2FReport,
   ChangeSinceRead,
   DirtyFile,
+  EditFormat,
   FileBlockDiff,
   FileBlockMode,
   FileBlockNewline,
@@ -52,6 +54,8 @@ export interface TransactionConfig {
   readonly diffLineLimit: number
   readonly tempFileKeep: number
   readonly maxCasRetries: number
+  /** Line tolerance for `mode=diff` anchor search. */
+  readonly maxEditDrift: number
 }
 
 interface Candidate {
@@ -61,6 +65,8 @@ interface Candidate {
   readonly observedRevision: string
   readonly content: string | null
   readonly preconditionError: B2FError | null
+  /** Set when an edit block's anchors did not resolve against observed content. */
+  readonly resolutionError: B2FError | null
   readonly result: MaterializeResult
 }
 
@@ -130,15 +136,6 @@ export function commitFileBlocks(
         .map(candidate => candidate.preconditionError)
         .filter((error): error is B2FError => error !== null)
       if (preconditionErrors.length > 0) {
-        const files: PreconditionFile[] = preconditionErrors.map(error => {
-          const path = error.path!
-          const version = fileVersionAt(config.root, head, path)
-          return {
-            path,
-            content: version === 'absent' ? null : readBlob(config.root, version),
-            fileVersion: version,
-          }
-        })
         return {
           status: 'precondition-failed',
           ok: false,
@@ -147,7 +144,28 @@ export function commitFileBlocks(
           results: [],
           errors: preconditionErrors,
           staleFiles: [],
-          files,
+          files: echoFiles(config.root, head, preconditionErrors),
+        }
+      }
+
+      // Checked after staleness so a concurrently changed file reports `stale`
+      // with fresh content rather than a misleading anchor error, and after
+      // preconditions so an absent file reports FILE_NOT_FOUND. Past both, the
+      // observed content IS current content, so an anchor failure is
+      // unambiguously the model's to fix and echoing that content is correct.
+      const resolutionErrors = candidates
+        .map(candidate => candidate.resolutionError)
+        .filter((error): error is B2FError => error !== null)
+      if (resolutionErrors.length > 0) {
+        return {
+          status: 'edit-unresolved',
+          ok: false,
+          commit: null,
+          repoRevision: head,
+          results: [],
+          errors: resolutionErrors,
+          staleFiles: [],
+          files: echoFiles(config.root, head, resolutionErrors),
         }
       }
 
@@ -249,23 +267,50 @@ function worktreeDirtyReport(repoRevision: string, dirtyFiles: readonly DirtyFil
   }
 }
 
+/**
+ * Read the current content of each errored path so the model can retry at once.
+ * Callers must have already cleared the staleness check, which is what makes
+ * this content both current and the right basis for a corrected proposal.
+ */
+function echoFiles(root: string, head: string, errors: readonly B2FError[]): PreconditionFile[] {
+  const seen = new Set<string>()
+  const files: PreconditionFile[] = []
+  for (const error of errors) {
+    const path = error.path
+    if (path === null || seen.has(path)) continue
+    seen.add(path)
+    const version = fileVersionAt(root, head, path)
+    files.push({
+      path,
+      content: version === 'absent' ? null : readBlob(root, version),
+      fileVersion: version,
+    })
+  }
+  return files
+}
+
 function buildCandidate(proposal: ObservedFileProposal, config: TransactionConfig): Candidate {
   const { block, normalizedPath } = proposal.entry
   const mode = block.mode as FileBlockMode
   const expectedVersion = proposal.observation.fileVersion
   const previous = readObservedContent(config.root, expectedVersion)
-  const proposed = convertNewlines(block.content, block.newline as FileBlockNewline)
 
-  let content: string | null
-  let status: MaterializeResult['status']
+  let content: string | null = null
+  let status: MaterializeResult['status'] = 'unchanged'
   let added = 0
   let removed = 0
   let rawDiff: string | null = null
+  let resolutionError: B2FError | null = null
+  let editFormat: Exclude<EditFormat, 'none'> | null = null
+  let editsProposed = 0
+  let editsApplied = 0
+  let fuzz = 0
 
   switch (mode) {
     case 'write':
     case 'create':
     case 'update': {
+      const proposed = convertNewlines(block.content, block.newline as FileBlockNewline)
       content = proposed
       status = expectedVersion === 'absent'
         ? 'created'
@@ -276,7 +321,39 @@ function buildCandidate(proposal: ObservedFileProposal, config: TransactionConfi
       removed = stats.removed
       break
     }
+    case 'edit':
+    case 'diff': {
+      editFormat = mode === 'edit' ? 'replace' : 'git_diff'
+      // An edit resolves against the exact observed bytes and preserves the
+      // file's own line endings, so `newline=` is never applied here; the
+      // validator rejects it explicitly rather than silently ignoring it.
+      if (expectedVersion === 'absent') {
+        // Reported as a precondition failure below; content is never consumed.
+        content = previous
+        break
+      }
+      const outcome = resolveEdit(editFormat, block.content, previous, config.maxEditDrift)
+      editsProposed = outcome.editsProposed
+      editsApplied = outcome.editsApplied
+      if (!outcome.ok) {
+        resolutionError = editError(outcome, normalizedPath)
+        // NEVER null: `null` content means "delete this path" in buildTree, and
+        // an unresolved edit must not be able to express deletion. The CAS loop
+        // returns on `resolutionError` before this value is read.
+        content = previous
+        break
+      }
+      content = outcome.content
+      fuzz = outcome.fuzz
+      status = previous === content ? 'unchanged' : 'updated'
+      rawDiff = unifiedDiff(previous, content, `a/${normalizedPath}`, `b/${normalizedPath}`)
+      const stats = rawDiff === null ? { added: 0, removed: 0 } : countDiffStats(rawDiff.split('\n'))
+      added = stats.added
+      removed = stats.removed
+      break
+    }
     case 'append': {
+      const proposed = convertNewlines(block.content, block.newline as FileBlockNewline)
       if (expectedVersion === 'absent') {
         content = proposed
         status = 'created'
@@ -306,9 +383,9 @@ function buildCandidate(proposal: ObservedFileProposal, config: TransactionConfi
 
   const preconditionError = mode === 'create' && expectedVersion !== 'absent'
     ? { code: 'FILE_EXISTS' as const, path: normalizedPath, hint: ERROR_HINTS.FILE_EXISTS }
-    : mode === 'update' && expectedVersion === 'absent'
-      ? { code: 'FILE_NOT_FOUND' as const, path: normalizedPath, hint: ERROR_HINTS.FILE_NOT_FOUND }
-      : null
+    : (mode === 'update' || mode === 'edit' || mode === 'diff') && expectedVersion === 'absent'
+        ? { code: 'FILE_NOT_FOUND' as const, path: normalizedPath, hint: ERROR_HINTS.FILE_NOT_FOUND }
+        : null
 
   return {
     path: normalizedPath,
@@ -317,6 +394,7 @@ function buildCandidate(proposal: ObservedFileProposal, config: TransactionConfi
     observedRevision: proposal.observation.repoRevision,
     content,
     preconditionError,
+    resolutionError,
     result: {
       path: normalizedPath,
       mode,
@@ -325,6 +403,10 @@ function buildCandidate(proposal: ObservedFileProposal, config: TransactionConfi
       added,
       removed,
       diffText: selectDiff(rawDiff, block.diff as FileBlockDiff, config.diffLineLimit),
+      editFormat,
+      editsProposed,
+      editsApplied,
+      fuzz,
     },
   }
 }

@@ -1,0 +1,116 @@
+{
+  "specVersion": "0.2.0",
+  "name": "@deepseek-ai/dsh-block-to-file",
+  "pluginTypes": [
+    "F1",
+    "F3"
+  ],
+  "facts": {
+    "modelVisible": true,
+    "registersTools": false,
+    "filesystem": "write",
+    "persistentState": true,
+    "subprocess": true,
+    "subagents": false,
+    "temporaryResources": true,
+    "customProtocol": true
+  },
+  "package": {
+    "path": "package.json"
+  },
+  "model": {
+    "dir": "src/model",
+    "readme": "src/model/README.md",
+    "files": [
+      {
+        "path": "prompt.ts",
+        "export": "DEFAULT_PROMPT",
+        "role": "staticText"
+      },
+      {
+        "path": "prompt.ts",
+        "export": "REPLACE_PROMPT",
+        "role": "staticText"
+      },
+      {
+        "path": "prompt.ts",
+        "export": "GIT_DIFF_PROMPT",
+        "role": "staticText"
+      },
+      {
+        "path": "prompt.ts",
+        "export": "buildPrompt",
+        "role": "dynamicRenderer"
+      }
+    ]
+  },
+  "help": {
+    "file": "src/help.ts",
+    "versionExport": "VERSION",
+    "commands": [
+      "file=<path>",
+      "file=<path> mode=create",
+      "file=<path> mode=update",
+      "file=<path> mode=append",
+      "file=<path> mode=delete",
+      "file=<path> mode=edit",
+      "file=<path> mode=diff"
+    ]
+  },
+  "tests": {
+    "contractTests": [
+      {
+        "file": "tests/prompt.spec.ts",
+        "references": [
+          "DEFAULT_PROMPT",
+          "REPLACE_PROMPT",
+          "GIT_DIFF_PROMPT",
+          "buildPrompt"
+        ]
+      }
+    ],
+    "runtimeTests": [
+      {
+        "file": "tests/index.spec.ts",
+        "layer": "L1"
+      },
+      {
+        "file": "tests/transaction.spec.ts",
+        "layer": "L2"
+      },
+      {
+        "file": "tests/durability.spec.ts",
+        "layer": "L2"
+      },
+      {
+        "file": "tests/validator.spec.ts",
+        "layer": "L2"
+      }
+    ]
+  },
+  "config": {
+    "file": "src/index.ts",
+    "schemaExport": "Config",
+    "rootField": "root",
+    "gcField": "tempFileKeep",
+    "assembly": {
+      "file": "src/index.ts"
+    }
+  },
+  "errors": {
+    "file": "src/errors.ts",
+    "export": "BlockToFileError",
+    "requiredFields": [
+      "code",
+      "path",
+      "hint"
+    ]
+  },
+  "contracts": [
+    {
+      "name": "b2f-block-protocol",
+      "file": "spec/block-protocol.json",
+      "versionField": "version"
+    }
+  ]
+}

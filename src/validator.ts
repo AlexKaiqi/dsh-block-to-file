@@ -6,7 +6,7 @@
  */
 
 import { posix } from 'node:path'
-import { ERROR_HINTS, type B2FError, type FileBlock } from './types.ts'
+import { EDIT_MODE_FOR_FORMAT, ERROR_HINTS, type B2FError, type EditFormat, type FileBlock } from './types.ts'
 
 /** Resolved configuration for one b2f pipeline run. */
 export interface B2FValidationConfig {
@@ -14,6 +14,11 @@ export interface B2FValidationConfig {
   readonly maxFileSize: number
   readonly maxTotalSize: number
   readonly maxFilesPerMessage: number
+  /**
+   * Which edit dialect this deployment exposes. Optional so the pure validator
+   * stays usable without deployment config; omitted means no partial edits.
+   */
+  readonly editFormat?: EditFormat | undefined
 }
 
 /** One validated block with its normalized path and raw content. */
@@ -33,9 +38,11 @@ export interface ValidationResult {
   readonly errors: readonly B2FError[]
 }
 
-const MODES = new Set(['write', 'create', 'update', 'append', 'delete'])
+const MODES = new Set(['write', 'create', 'update', 'append', 'delete', 'edit', 'diff'])
 const DIFFS = new Set(['full', 'limited', 'stats', 'none'])
 const NEWLINES = new Set(['preserve', 'lf', 'crlf'])
+/** Modes whose body is a patch rather than file content. */
+const EDIT_MODES = new Set<string>(Object.values(EDIT_MODE_FOR_FORMAT))
 
 /**
  * Validate every file block in one assistant message.
@@ -110,6 +117,28 @@ export function validateFileBlocks(
         path: block.path,
         hint: ERROR_HINTS.DELETE_CONTENT,
       })
+    }
+    if (EDIT_MODES.has(block.mode)) {
+      const active = config.editFormat ?? 'none'
+      const expected = active === 'none' ? null : EDIT_MODE_FOR_FORMAT[active]
+      if (block.mode !== expected) {
+        errors.push({
+          code: 'EDIT_MODE_DISABLED',
+          path: block.path,
+          hint: expected === null
+            ? `${ERROR_HINTS.EDIT_MODE_DISABLED} (partial edits are disabled; emit the full file content instead)`
+            : `${ERROR_HINTS.EDIT_MODE_DISABLED} (got mode=${block.mode}; this deployment uses mode=${expected})`,
+        })
+      }
+      if (block.content.trim().length === 0) {
+        errors.push({ code: 'EDIT_EMPTY', path: block.path, hint: ERROR_HINTS.EDIT_EMPTY })
+      }
+      // An edit resolves against the observed bytes and preserves the file's own
+      // line endings. Only an EXPLICIT newline= is an error: the deployment
+      // default is stamped on every block by the parser and must not reject one.
+      if (block.newlineExplicit) {
+        errors.push({ code: 'EDIT_NEWLINE_ATTR', path: block.path, hint: ERROR_HINTS.EDIT_NEWLINE_ATTR })
+      }
     }
     if (!isWellFormedUtf16(block.content)) {
       errors.push({
