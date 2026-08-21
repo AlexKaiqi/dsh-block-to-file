@@ -16,6 +16,7 @@ describe('DEFAULT_PROMPT', () => {
     expect(DEFAULT_PROMPT).toContain('file=<relative-path>')
     expect(DEFAULT_PROMPT).toContain('mode=write|create|update|append|delete')
     expect(DEFAULT_PROMPT).toContain('one atomic transaction')
+    expect(DEFAULT_PROMPT).toContain('same transaction root')
   })
 
   it('warns against labelling display-only blocks', () => {

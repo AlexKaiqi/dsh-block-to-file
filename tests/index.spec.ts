@@ -1,10 +1,10 @@
 /* oxlint-disable typescript/no-unsafe-assignment -- Vitest asymmetric matchers are typed as any. */
 import { execFileSync } from 'node:child_process'
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { join, resolve } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
-import { Context } from '@deepseek-ai/cordis'
+import { Context, Service } from '@deepseek-ai/cordis'
 import { CallId, MessageId, type ContentBlock } from '@deepseek-ai/dsh-llm'
 import { Inbox } from '@deepseek-ai/dsh-agent'
 import type { Agent } from '@deepseek-ai/dsh-agent'
@@ -20,6 +20,43 @@ import * as BlockToFile from '../src/index.ts'
 const contexts: Context[] = []
 const roots: string[] = []
 const tempRoots: string[] = []
+
+class FixtureFileSystem extends Service {
+  constructor(ctx: Context) {
+    super(ctx, 'fs')
+  }
+
+  async resolve(path: string, options?: { readonly cwd?: string }): Promise<{ path: string }> {
+    return { path: resolve(options?.cwd ?? process.cwd(), path) }
+  }
+
+  async stat(target: object): Promise<{ type: 'file'; version: string } | undefined> {
+    const path = (target as { path: string }).path
+    if (!existsSync(path)) return undefined
+    const info = statSync(path)
+    if (!info.isFile()) return undefined
+    return { type: 'file', version: `${info.size}:${info.mtimeMs}` }
+  }
+}
+
+class FixtureSandboxPolicy extends Service {
+  constructor(
+    ctx: Context,
+    private readonly config: {
+      readonly mode: 'read-only' | 'workspace-write' | 'danger-full-access'
+      readonly workspaceRoot: string
+    },
+  ) {
+    super(ctx, 'sandboxPolicy')
+  }
+
+  resolve(request?: { readonly session?: { readonly header: { readonly cwd?: string } } }) {
+    return {
+      mode: this.config.mode,
+      workspaceRoot: request?.session?.header.cwd ?? this.config.workspaceRoot,
+    }
+  }
+}
 
 afterEach(async () => {
   for (const ctx of contexts.splice(0)) await ctx.fiber.dispose()
@@ -74,13 +111,20 @@ function makeAgent(ctx: Context, id: string, root: string, inject: (message: Use
   return agent
 }
 
-async function setup(root: string, config: Partial<BlockToFile.Config> = {}) {
+async function setup(
+  root: string,
+  config: Partial<BlockToFile.Config> = {},
+  sandboxMode?: 'read-only' | 'workspace-write' | 'danger-full-access',
+  withFileSystem = false,
+) {
   const ctx = new Context()
   contexts.push(ctx)
   await ctx.plugin(SessionStore)
   await ctx.plugin(SystemPrompt)
   await ctx.plugin(ToolRuntime)
   await ctx.plugin(AgentRegistry)
+  if (withFileSystem) await ctx.plugin(FixtureFileSystem)
+  if (sandboxMode !== undefined) await ctx.plugin(FixtureSandboxPolicy, { mode: sandboxMode, workspaceRoot: root })
   await ctx.plugin(BlockToFile, Object.assign({ root }, config) as BlockToFile.Config)
   return ctx
 }
@@ -311,6 +355,100 @@ describe('block-to-file plugin', () => {
     expect(result.isError).toBe(false)
   })
 
+  it('waits for external publication before running same-message tools', async () => {
+    const root = makeRoot()
+    const ctx = await setup(root)
+    const injected: UserMessage[] = []
+    const agent = makeAgent(ctx, 'b2f-plugin-publisher-wait', root, message => injected.push(message))
+    ctx.tools.register(defineTool({
+      name: 'noop',
+      description: 'noop',
+      parameters: {},
+      output: { schema: { type: 'string' }, render: (_args, value) => [{ type: 'text', text: value }] },
+      async execute() { return 'ok' },
+    }))
+    let release!: (receipt: { scope: string, revision: string, noOp: boolean }) => void
+    const pending = new Promise<{ scope: string, revision: string, noOp: boolean }>(resolve => {
+      release = resolve
+    })
+    ctx.b2f.registerPublisher(request => {
+      expect(request.paths).toEqual(['published.txt'])
+      return pending
+    })
+
+    agent.session.append('assistant/message', {
+      turn: 1,
+      step: 1,
+      message: {
+        id: MessageId('msg-publisher-wait'),
+        role: 'assistant',
+        content: [
+          textBlock('```text file=published.txt\npublished\n```\n'),
+          { type: 'tool-call', id: CallId('call-publisher-wait'), name: 'noop', arguments: '{}' },
+        ],
+        source: { kind: 'model', provider: 'test', model: 'test' },
+      },
+    }, { surfaceOp: 'append' })
+
+    let finished = false
+    const execution = ctx.tools.execute({
+      signal: new AbortController().signal,
+      callId: CallId('call-publisher-wait'),
+      name: 'noop',
+      arguments: {},
+      agent,
+    }).then((result) => {
+      finished = true
+      return result
+    })
+    await Promise.resolve()
+    expect(finished).toBe(false)
+    release({ scope: 'external', revision: 'canonical-1', noOp: false })
+    expect((await execution).isError).toBe(false)
+    expect(feedbackText(injected.at(-1)!)).toContain('[b2f] published external revision canonical-1')
+  })
+
+  it('blocks same-message tools when external publication fails', async () => {
+    const root = makeRoot()
+    const ctx = await setup(root)
+    const injected: UserMessage[] = []
+    const agent = makeAgent(ctx, 'b2f-plugin-publisher-fail', root, message => injected.push(message))
+    ctx.tools.register(defineTool({
+      name: 'noop',
+      description: 'noop',
+      parameters: {},
+      output: { schema: { type: 'string' }, render: (_args, value) => [{ type: 'text', text: value }] },
+      async execute() { return 'ok' },
+    }))
+    ctx.b2f.registerPublisher(() => Promise.reject(new Error('canonical store unavailable')))
+
+    agent.session.append('assistant/message', {
+      turn: 1,
+      step: 1,
+      message: {
+        id: MessageId('msg-publisher-fail'),
+        role: 'assistant',
+        content: [
+          textBlock('```text file=failed-publication.txt\nlocal\n```\n'),
+          { type: 'tool-call', id: CallId('call-publisher-fail'), name: 'noop', arguments: '{}' },
+        ],
+        source: { kind: 'model', provider: 'test', model: 'test' },
+      },
+    }, { surfaceOp: 'append' })
+
+    const result = await ctx.tools.execute({
+      signal: new AbortController().signal,
+      callId: CallId('call-publisher-fail'),
+      name: 'noop',
+      arguments: {},
+      agent,
+    })
+    expect(result.isError).toBe(true)
+    expect(result.content).toEqual([{ type: 'text', text: expect.stringContaining('publication-failed') }])
+    expect(feedbackText(injected.at(-1)!)).toContain('external publication failed after workspace commit')
+    expect(feedbackText(injected.at(-1)!)).toContain('canonical store unavailable')
+  })
+
   it('applies the configured default newline when a block omits newline=', async () => {
     const root = makeRoot()
     const ctx = await setup(root, { newline: 'crlf' })
@@ -387,11 +525,12 @@ describe('block-to-file plugin', () => {
     expect(ctx.b2f.resolveRoot(agent, agent.session)).toBe(root)
   })
 
-  it('lets a selective resolver claim only matching file paths', async () => {
+  it('lets a selective resolver claim matching paths and rejects mixed roots', async () => {
     const root = makeRoot()
     const scoped = makeRoot()
     const ctx = await setup(root)
-    const agent = makeAgent(ctx, 'b2f-plugin-selective-root', root, () => {})
+    const injected: UserMessage[] = []
+    const agent = makeAgent(ctx, 'b2f-plugin-selective-root', root, message => injected.push(message))
     const dispose = ctx.b2f.registerRootResolver((_agent, _session, paths) =>
       paths !== undefined && paths.length > 0 && paths.every(path => path.startsWith('work/')) ? scoped : undefined)
 
@@ -404,7 +543,99 @@ describe('block-to-file plugin', () => {
 
     expect(readFileSync(join(scoped, 'work/root/surface.md'), 'utf8')).toBe('scoped\n')
     expect(existsSync(join(root, 'work/root/surface.md'))).toBe(false)
+
+    appendAssistant(
+      agent,
+      'msg-mixed-root',
+      '```text file=work/root/second.md\nscoped\n```\n```text file=source.ts\nsource\n```\n',
+      2,
+    )
+    await Promise.resolve()
+    expect(existsSync(join(scoped, 'work/root/second.md'))).toBe(false)
+    expect(existsSync(join(root, 'source.ts'))).toBe(false)
+    expect(feedbackText(injected.at(-1)!)).toContain('MIXED_ROOT_SCOPE')
     dispose()
+  })
+
+  it('awaits an asynchronously prepared transaction scope', async () => {
+    const root = makeRoot()
+    const scoped = makeRoot()
+    const ctx = await setup(root)
+    let notified!: () => void
+    const feedback = new Promise<void>(resolve => { notified = resolve })
+    const agent = makeAgent(ctx, 'b2f-async-scope', root, () => notified())
+    ctx.b2f.registerRootResolver(async (_agent, _session, paths) =>
+      paths?.every(path => path.startsWith('work/'))
+        ? { root: scoped, scope: 'async-scope', authorization: 'mounted-workspace' }
+        : undefined)
+
+    appendAssistant(agent, 'msg-async-scope', '```text file=work/state.txt\nready\n```\n')
+    await feedback
+    expect(readFileSync(join(scoped, 'work/state.txt'), 'utf8')).toBe('ready\n')
+  })
+
+  it('enforces the shared sandbox policy and trusted mounted scopes', async () => {
+    const readOnlyRoot = makeRoot()
+    const readOnlyCtx = await setup(readOnlyRoot, {}, 'read-only')
+    const readOnlyFeedback: UserMessage[] = []
+    const readOnlyAgent = makeAgent(readOnlyCtx, 'b2f-read-only', readOnlyRoot, message => readOnlyFeedback.push(message))
+    appendAssistant(readOnlyAgent, 'msg-read-only', '```text file=denied.txt\ndenied\n```\n')
+    await Promise.resolve()
+    expect(existsSync(join(readOnlyRoot, 'denied.txt'))).toBe(false)
+    expect(feedbackText(readOnlyFeedback.at(-1)!)).toContain('SANDBOX_DENIED')
+
+    const root = makeRoot()
+    const mounted = makeRoot()
+    const ctx = await setup(root, {}, 'workspace-write')
+    const injected: UserMessage[] = []
+    const agent = makeAgent(ctx, 'b2f-mounted-policy', root, message => injected.push(message))
+    const disposeOutside = ctx.b2f.registerRootResolver(() => mounted)
+    appendAssistant(agent, 'msg-outside-policy', '```text file=outside.txt\noutside\n```\n')
+    await Promise.resolve()
+    expect(existsSync(join(mounted, 'outside.txt'))).toBe(false)
+    expect(feedbackText(injected.at(-1)!)).toContain('SANDBOX_DENIED')
+    disposeOutside()
+
+    ctx.b2f.registerRootResolver(() => ({
+      root: mounted,
+      scope: 'trusted-mount',
+      authorization: 'mounted-workspace',
+    }))
+    appendAssistant(agent, 'msg-mounted-policy', '```text file=mounted.txt\nmounted\n```\n', 2)
+    await Promise.resolve()
+    expect(readFileSync(join(mounted, 'mounted.txt'), 'utf8')).toBe('mounted\n')
+  })
+
+  it('bridges settled writes into provider-native fs observations', async () => {
+    const root = makeRoot()
+    const ctx = await setup(root, {}, undefined, true)
+    const observations: Array<{
+      target: object
+      observation: { readonly kind: 'present'; readonly version: unknown } | { readonly kind: 'absent' }
+      actor: { readonly agent?: Agent }
+    }> = []
+    const on = ctx.on.bind(ctx) as unknown as (
+      name: string,
+      listener: (target: object, observation: typeof observations[number]['observation'], actor: { agent?: Agent }) => void,
+    ) => unknown
+    on('fs/observed', (target, observation, actor) => observations.push({ target, observation, actor }))
+    const notices: Array<() => void> = []
+    const agent = makeAgent(ctx, 'b2f-fs-observation', root, () => notices.shift()?.())
+    const nextNotice = () => new Promise<void>(resolveNotice => notices.push(resolveNotice))
+
+    const created = nextNotice()
+    appendAssistant(agent, 'msg-fs-observed-create', '```text file=observed.txt\nobserved\n```\n')
+    await created
+    expect(observations).toHaveLength(1)
+    expect(observations[0]?.observation.kind).toBe('present')
+    expect(observations[0]?.actor.agent).toBe(agent)
+
+    const deleted = nextNotice()
+    appendAssistant(agent, 'msg-fs-observed-delete', '```text file=observed.txt mode=delete\n```\n', 2)
+    await deleted
+    expect(observations).toHaveLength(2)
+    expect(observations[1]?.observation.kind).toBe('absent')
+    expect(observations[1]?.actor.agent).toBe(agent)
   })
 
   it('releases Agent observations when the Agent is disposed', async () => {
@@ -589,6 +820,7 @@ describe('block-to-file plugin', () => {
 
     expect(reports).toHaveLength(1)
     expect(reports[0]?.status).toBe('committed')
+    expect(reports[0]?.scope).toBe('workspace')
     expect(reports[0]?.results[0]).toMatchObject({
       editFormat: 'replace',
       editsProposed: 1,

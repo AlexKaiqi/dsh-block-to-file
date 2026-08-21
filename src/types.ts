@@ -73,6 +73,8 @@ export type B2FErrorCode =
   | 'PATH_REQUIRED'
   | 'PATH_ABSOLUTE'
   | 'PATH_ESCAPE'
+  | 'MIXED_ROOT_SCOPE'
+  | 'SANDBOX_DENIED'
   | 'DUPLICATE_PATH'
   | 'SIZE_EXCEEDED'
   | 'TOTAL_SIZE_EXCEEDED'
@@ -96,6 +98,7 @@ export type B2FErrorCode =
   | 'EDIT_SPAN_OVERLAP'
   | 'EDIT_CONTEXT_MISMATCH'
   | 'MATERIALIZE_FAILED'
+  | 'PUBLICATION_FAILED'
 
 /** One actionable validation, precondition, or materialization failure. */
 export interface B2FError {
@@ -164,6 +167,13 @@ export interface DirtyFile {
   readonly targetVersion: FileVersion
 }
 
+/** One external canonical publication completed after the workspace transaction. */
+export interface B2FPublicationReceipt {
+  readonly scope: string
+  readonly revision: string
+  readonly noOp: boolean
+}
+
 /** A whole assistant message was committed as one Git transaction. */
 export interface B2FCommittedReport {
   readonly status: 'committed'
@@ -173,6 +183,7 @@ export interface B2FCommittedReport {
   readonly results: readonly MaterializeResult[]
   readonly errors: readonly []
   readonly staleFiles: readonly []
+  readonly publications?: readonly B2FPublicationReceipt[]
 }
 
 /** Every proposal was already satisfied, so no commit was created. */
@@ -184,6 +195,7 @@ export interface B2FUnchangedReport {
   readonly results: readonly MaterializeResult[]
   readonly errors: readonly []
   readonly staleFiles: readonly []
+  readonly publications?: readonly B2FPublicationReceipt[]
 }
 
 /** No proposal was committed because at least one target path was stale. */
@@ -261,8 +273,19 @@ export interface B2FProjectionFailedReport {
   readonly staleFiles: readonly []
 }
 
+/** Workspace transaction settled, but an external canonical publisher failed. */
+export interface B2FPublicationFailedReport {
+  readonly status: 'publication-failed'
+  readonly ok: false
+  readonly commit: string | null
+  readonly repoRevision: string
+  readonly results: readonly MaterializeResult[]
+  readonly errors: readonly B2FError[]
+  readonly staleFiles: readonly []
+}
+
 /** Full transactional outcome of one assistant message's b2f pipeline run. */
-export type B2FReport =
+export type B2FReport = (
   | B2FCommittedReport
   | B2FUnchangedReport
   | B2FStaleReport
@@ -271,6 +294,11 @@ export type B2FReport =
   | B2FEditUnresolvedReport
   | B2FFailedReport
   | B2FProjectionFailedReport
+  | B2FPublicationFailedReport
+) & {
+  /** Formal transaction scope selected before authorization and publication. */
+  readonly scope?: string
+}
 
 /** Per-step pipeline state retained between session/event and tools/pre-execute. */
 export interface StepB2FState {
@@ -285,6 +313,8 @@ export const ERROR_HINTS: Record<B2FErrorCode, string> = {
   PATH_REQUIRED: 'add file=<relative-path> to the fenced code block info string',
   PATH_ABSOLUTE: 'use a path relative to $DSH_B2F_ROOT, e.g. file=src/app.py',
   PATH_ESCAPE: 'use a relative path inside $DSH_B2F_ROOT; `.` and `..` path segments are rejected',
+  MIXED_ROOT_SCOPE: 'split paths from different workspace scopes into separate assistant messages',
+  SANDBOX_DENIED: 'change the Session sandbox mode through the approved sandbox flow, then retry in a new message',
   DUPLICATE_PATH: 'merge every block targeting this path into one file block in this message',
   SIZE_EXCEEDED: 'split the file into smaller files or reduce its content',
   TOTAL_SIZE_EXCEEDED: 'split the content across multiple assistant messages',
@@ -308,4 +338,5 @@ export const ERROR_HINTS: Record<B2FErrorCode, string> = {
   EDIT_SPAN_OVERLAP: 'merge the overlapping edits into one, or target distinct regions',
   EDIT_CONTEXT_MISMATCH: 'recheck the line numbers and context lines against the file content shown below',
   MATERIALIZE_FAILED: 'retry the operation, or check repository state, disk space, and permissions',
+  PUBLICATION_FAILED: 'retry in a new message after checking the external canonical store state',
 }

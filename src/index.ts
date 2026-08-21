@@ -23,7 +23,8 @@ import { assertTempDirOutsideRoot as assertTmpOutside, resolveGitDir, resolveTem
 import { renderFeedback as renderB2FFeedback } from './feedback.ts'
 import { DEFAULT_MAX_DRIFT } from './edit.ts'
 import { buildPrompt, DEFAULT_PROMPT } from './model/prompt.ts'
-import { B2FService as B2FServiceClass } from './service.ts'
+import { B2FService as B2FServiceClass, type B2FRootScope } from './service.ts'
+import { b2fError, BlockToFileError } from './errors.ts'
 import type { B2FError, B2FReport, EditFormat } from './types.ts'
 
 export { parseFileBlocks } from './parser.ts'
@@ -37,13 +38,13 @@ export { b2fError, BlockToFileError, isB2FError } from './errors.ts'
 export { buildPrompt, DEFAULT_PROMPT, GIT_DIFF_PROMPT, REPLACE_PROMPT } from './model/prompt.ts'
 export { commitFileBlocks, fileVersionAt, projectRevision, resolveCanonicalRevision, resolveWorktreeRevision } from './transaction.ts'
 export type { ObservedFileProposal, TransactionConfig } from './transaction.ts'
-export { renderEditUnresolvedFeedback, renderFailureFeedback, renderFeedback, renderProjectionFailureFeedback, renderStaleFeedback, renderSuccessFeedback } from './feedback.ts'
+export { renderEditUnresolvedFeedback, renderFailureFeedback, renderFeedback, renderProjectionFailureFeedback, renderPublicationFailureFeedback, renderStaleFeedback, renderSuccessFeedback } from './feedback.ts'
 export { countDiffStats, unifiedDiff } from './diff.ts'
 export type { DiffHunk } from './diff.ts'
 export { B2FService } from './service.ts'
-export type { B2FCommitConfig, B2FRootResolver } from './service.ts'
+export type { B2FCommitConfig, B2FPublicationRequest, B2FPublisher, B2FRootResolution, B2FRootResolver, B2FRootScope } from './service.ts'
 export { EDIT_MODE_FOR_FORMAT } from './types.ts'
-export type { B2FCommittedReport, B2FEditUnresolvedReport, B2FError, B2FErrorCode, B2FFailedReport, B2FPreconditionFailedReport, B2FProjectionFailedReport, B2FReport, B2FStaleReport, B2FUnchangedReport, B2FWorktreeDirtyReport, ChangeSinceRead, DirtyFile, EditFormat, FileBlock, FileBlockDiff, FileBlockEncoding, FileBlockMode, FileBlockNewline, FileObservation, FileVersion, MaterializeResult, MaterializeStatus, PreconditionFile, StaleFile, StepB2FState } from './types.ts'
+export type { B2FCommittedReport, B2FEditUnresolvedReport, B2FError, B2FErrorCode, B2FFailedReport, B2FPreconditionFailedReport, B2FProjectionFailedReport, B2FPublicationFailedReport, B2FPublicationReceipt, B2FReport, B2FStaleReport, B2FUnchangedReport, B2FWorktreeDirtyReport, ChangeSinceRead, DirtyFile, EditFormat, FileBlock, FileBlockDiff, FileBlockEncoding, FileBlockMode, FileBlockNewline, FileObservation, FileVersion, MaterializeResult, MaterializeStatus, PreconditionFile, StaleFile, StepB2FState } from './types.ts'
 
 export const name = 'block-to-file'
 export const inject = ['systemPrompt', 'tools', 'agents']
@@ -136,7 +137,7 @@ export function apply(ctx: Context, config: Config): void {
   assertTmpOutside(resolveGitDir(resolved.root), resolved.root)
   sweepTempDir(defaultTmp, resolved.tempFileKeep)
   new B2FServiceClass(ctx, resolved.root)
-  const deniedCalls = new Map<string, string>()
+  const settlements = new Map<string, Promise<B2FReport>>()
   const callsByStep = new Map<string, readonly string[]>()
 
   ctx.systemPrompt.section({
@@ -153,8 +154,8 @@ export function apply(ctx: Context, config: Config): void {
 
   ctx.on('agent/disposed', ({ agent }) => {
     const prefix = `${agent.id}:`
-    for (const key of deniedCalls.keys()) {
-      if (key.startsWith(prefix)) deniedCalls.delete(key)
+    for (const key of settlements.keys()) {
+      if (key.startsWith(prefix)) settlements.delete(key)
     }
     for (const key of callsByStep.keys()) {
       if (key.startsWith(prefix)) callsByStep.delete(key)
@@ -165,7 +166,7 @@ export function apply(ctx: Context, config: Config): void {
   ctx.on('session/event', (session: Session, event: SessionEvent) => {
     if (event.type === 'step/end') {
       const stepKey = stateKey(session.id, event.data.turn, event.data.step)
-      for (const key of callsByStep.get(stepKey) ?? []) deniedCalls.delete(key)
+      for (const key of callsByStep.get(stepKey) ?? []) settlements.delete(key)
       callsByStep.delete(stepKey)
       return
     }
@@ -173,46 +174,56 @@ export function apply(ctx: Context, config: Config): void {
 
     const agent = ctx.agents.get(session.id)
     if (agent === undefined) return
-    const report = runPipeline(event.data.message.content, resolved, agent, session, ctx.b2f)
-    if (report === null) return
-    // Line-anchored dialects need numbered echoes so the model can re-anchor;
-    // content-anchored ones need verbatim text to copy.
-    const feedback = renderB2FFeedback(report, resolved.editFormat === 'git_diff')
-    if (!report.ok) {
-      const callKeys = event.data.message.content
-        .filter((block): block is Extract<ContentBlock, { type: 'tool-call' }> => block.type === 'tool-call')
-        .map(block => callKey(session.id, block.id))
-      for (const key of callKeys) deniedCalls.set(key, report.status)
-      if (callKeys.length > 0) {
-        callsByStep.set(stateKey(session.id, event.data.turn, event.data.step), callKeys)
-      }
-    }
-    try {
-      ctx.emit('b2f/transaction', session, report)
-    } catch {
-      // Observation failures cannot change an already settled transaction.
+    const pipeline = runPipeline(event.data.message.content, resolved, agent, session, ctx.b2f)
+    if (pipeline === null) return
+    const settlement = isPromiseLike(pipeline)
+      ? pipeline.then(outcome => settlePublication(ctx.b2f, agent, session, outcome))
+      : settlePublication(ctx.b2f, agent, session, pipeline)
+    const callKeys = event.data.message.content
+      .filter((block): block is Extract<ContentBlock, { type: 'tool-call' }> => block.type === 'tool-call')
+      .map(block => callKey(session.id, block.id))
+    for (const key of callKeys) settlements.set(key, settlement)
+    if (callKeys.length > 0) {
+      callsByStep.set(stateKey(session.id, event.data.turn, event.data.step), callKeys)
     }
 
-    queueMicrotask(() => {
+    void settlement.then((report) => {
+      // Line-anchored dialects need numbered echoes so the model can re-anchor;
+      // content-anchored ones need verbatim text to copy.
+      const feedback = renderB2FFeedback(report, resolved.editFormat === 'git_diff')
+      try {
+        ctx.emit('b2f/transaction', session, report)
+      } catch {
+        // Observation failures cannot change an already settled transaction.
+      }
       injectFeedback(agent, feedback)
     })
   })
 
-  // Only tool calls emitted beside a failed transaction are denied. Correlating
-  // by rootCallId also covers nested Code Mode dispatch without leaking failure
+  // Same-message tools await local and external publication. Correlating by
+  // rootCallId also covers nested Code Mode dispatch without leaking settlement
   // state into a later model step.
   ctx.on('tools/pre-execute', async (exec: ToolExecution, next: () => Promise<PreToolDecision>): Promise<PreToolDecision> => {
     const agent = exec.agent
     if (agent === undefined) return next()
-    const status = deniedCalls.get(callKey(agent.id, exec.rootCallId))
-    if (status !== undefined) {
+    const settlement = settlements.get(callKey(agent.id, exec.rootCallId))
+    if (settlement === undefined) return next()
+    const report = await settlement
+    if (!report.ok) {
       return {
         kind: 'deny',
-        reason: `[b2f] file transaction ${status}; see the [b2f] feedback before retrying.`,
+        reason: `[b2f] file transaction ${report.status}; see the [b2f] feedback before retrying.`,
       }
     }
     return next()
   })
+}
+
+interface PipelineOutcome {
+  readonly report: B2FReport
+  readonly root?: string
+  readonly scope?: string
+  readonly paths: readonly string[]
 }
 
 /** Run parse → validate → compare-and-commit for one assistant message. */
@@ -222,7 +233,7 @@ function runPipeline(
   agent: Agent,
   session: Session,
   service: B2FServiceClass,
-): B2FReport | null {
+): PipelineOutcome | Promise<PipelineOutcome> | null {
   const text = content
     .filter((block): block is Extract<ContentBlock, { type: 'text' }> => block.type === 'text')
     .map(block => block.text)
@@ -233,33 +244,88 @@ function runPipeline(
 
   const parsed = parseBlocks(text, config.newline)
   if (parsed.blocks.length === 0 && parsed.errors.length === 0) return null
-  if (!isWellFormedUtf16(text)) {
-    return failedReport([{
-      code: 'ENCODING_INVALID',
-      path: null,
-      hint: 'emit valid UTF-8 text only (no unpaired surrogate code points)',
-    }])
-  }
   const paths = parsed.blocks.map(block => block.path)
-  const root = service.resolveRoot(agent, session, paths)
-  const validation = validateBlocks(parsed.blocks, {
-    root,
-    maxFileSize: config.maxFileSize,
-    maxTotalSize: config.maxTotalSize,
-    maxFilesPerMessage: config.maxFilesPerMessage,
-    editFormat: config.editFormat,
-  })
+  if (!isWellFormedUtf16(text)) {
+    return {
+      report: failedReport([{
+        code: 'ENCODING_INVALID',
+        path: null,
+        hint: 'emit valid UTF-8 text only (no unpaired surrogate code points)',
+      }]),
+      paths,
+    }
+  }
+  const fail = (error: unknown): PipelineOutcome => {
+    const reported = error instanceof BlockToFileError
+      ? error.toB2FError()
+      : b2fError('MATERIALIZE_FAILED', null, error instanceof Error ? error.message : String(error))
+    return { report: failedReport([reported]), paths }
+  }
+  const commitScope = (scope: B2FRootScope): PipelineOutcome => {
+    try {
+      service.authorizeScope(scope, session)
+      const validation = validateBlocks(parsed.blocks, {
+        root: scope.root,
+        maxFileSize: config.maxFileSize,
+        maxTotalSize: config.maxTotalSize,
+        maxFilesPerMessage: config.maxFilesPerMessage,
+        editFormat: config.editFormat,
+      })
+      const errors: B2FError[] = [...parsed.errors, ...validation.errors]
+      if (errors.length > 0) return { report: failedReport(errors), root: scope.root, scope: scope.scope, paths }
+      const report = service.commit(agent, session, validation.validated, {
+        canonicalRef: config.canonicalRef,
+        diffLineLimit: config.diffLineLimit,
+        tempFileKeep: config.tempFileKeep,
+        maxCasRetries: config.maxCasRetries,
+        maxEditDrift: config.maxEditDrift,
+      }, scope.root)
+      return { report, root: scope.root, scope: scope.scope, paths }
+    } catch (error) {
+      return fail(error)
+    }
+  }
 
-  const errors: B2FError[] = [...parsed.errors, ...validation.errors]
-  if (errors.length > 0) return failedReport(errors)
+  try {
+    const scope = service.resolveScope(agent, session, paths)
+    return isPromiseLike(scope) ? scope.then(commitScope, fail) : commitScope(scope)
+  } catch (error) {
+    return fail(error)
+  }
+}
 
-  return service.commit(agent, session, validation.validated, {
-    canonicalRef: config.canonicalRef,
-    diffLineLimit: config.diffLineLimit,
-    tempFileKeep: config.tempFileKeep,
-    maxCasRetries: config.maxCasRetries,
-    maxEditDrift: config.maxEditDrift,
-  }, root)
+function settlePublication(
+  service: B2FServiceClass,
+  agent: Agent,
+  session: Session,
+  outcome: PipelineOutcome,
+): Promise<B2FReport> {
+  const { report, root, scope, paths } = outcome
+  const scopedReport: B2FReport = scope === undefined ? report : { ...report, scope }
+  if (!report.ok || root === undefined || scope === undefined) return Promise.resolve(scopedReport)
+  if (!service.hasPublishers() && !service.hasFileSystemObserver()) return Promise.resolve(scopedReport)
+  const request = { agent, session, root, scope, paths, report }
+  const publication = service.hasPublishers() ? service.publish(request) : Promise.resolve([])
+  return publication.then(
+    async (publications) => {
+      await service.observeFileSystem(request)
+      return publications.length === 0 ? scopedReport : { ...scopedReport, publications }
+    },
+    async (error: unknown) => {
+      await service.observeFileSystem(request)
+      const detail = error instanceof Error ? error.message : String(error)
+      return {
+        status: 'publication-failed',
+        ok: false,
+        scope,
+        commit: report.commit,
+        repoRevision: report.repoRevision,
+        results: report.results,
+        errors: [b2fError('PUBLICATION_FAILED', null, detail)],
+        staleFiles: [],
+      }
+    },
+  )
 }
 
 function failedReport(errors: readonly B2FError[]): B2FReport {
@@ -359,6 +425,10 @@ function isWellFormedUtf16(text: string): boolean {
     }
   }
   return true
+}
+
+function isPromiseLike<T>(value: T | Promise<T>): value is Promise<T> {
+  return typeof (value as Promise<T> | undefined)?.then === 'function'
 }
 
 function stateKey(sessionId: string, turn: number, step: number): string {

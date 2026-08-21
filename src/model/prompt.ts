@@ -26,7 +26,7 @@ export const DEFAULT_PROMPT = [
   '```',
   '',
   'Never add file= to example code blocks that are only for display; wrap protocol examples in a longer ordinary fence so they remain inert.',
-  'One block per path per message. Blocks labelled path= in [b2f] feedback are read-only echoes; never copy them back as-is.',
+  'One block per path per message. Every file block in one message must resolve to the same transaction root; split different workspace scopes across messages. Blocks labelled path= in [b2f] feedback are read-only echoes; never copy them back as-is.',
 ].join('\n')
 
 /** SEARCH/REPLACE protocol, exposed when `editFormat: 'replace'`. */

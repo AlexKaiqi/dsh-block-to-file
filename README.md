@@ -178,20 +178,45 @@ default Session workspace can handle them:
 ```ts
 const dispose = ctx.b2f.registerRootResolver(
   (agent, session, paths) => paths?.every(isCheckoutPath)
-    ? checkoutRootFor(agent, session)
+    ? {
+        root: checkoutRootFor(agent, session),
+        scope: 'checkout',
+        authorization: 'mounted-workspace',
+      }
     : undefined,
 )
 ctx.effect(() => dispose)
 ```
 
-The newest resolver returning a root wins. The default resolver uses
+A consumer that owns an external canonical store may also register an async
+publisher. Same-message tools await the newest publisher that claims the
+transaction; a rejection becomes `publication-failed` and blocks those tools.
+A successful receipt is rendered separately from the local workspace commit:
+
+```ts
+const disposePublisher = ctx.b2f.registerPublisher(async request => {
+  if (request.scope !== 'checkout') return undefined
+  const result = await publishCanonical(request)
+  return { scope: 'example', revision: result.revision, noOp: result.noOp }
+})
+ctx.effect(() => disposePublisher)
+```
+
+Every path is resolved independently. If one message spans more than one root
+or named scope, the whole transaction fails with `MIXED_ROOT_SCOPE`. Resolvers
+may prepare a scope asynchronously. The newest resolver returning a claim wins.
+When `ctx.sandboxPolicy` is mounted, b2f consumes that same per-Session policy:
+`read-only` rejects every mutation, `workspace-write` accepts the Session root
+and trusted `mounted-workspace` claims, and `danger-full-access` retains the
+configured b2f boundary. The default resolver uses
 `session.header.cwd`, falling back to the static `config.root` / `$WS` /
-`$DSH_B2F_ROOT` value. b2f pins an agent's canonical
-snapshot when its
+`$DSH_B2F_ROOT` value. b2f pins an agent's canonical snapshot when its
 repository view is first prepared and advances it only after commit or stale
-feedback. A read-capable plugin with exact path information may replace the
-snapshot fallback with `ctx.b2f.recordObservation(agentId, {...})`;
-b2f itself has no dependency on that plugin.
+feedback. When `ctx.fs` is mounted, a successful b2f settlement resolves and
+stats each result through that provider and emits `fs/observed` before
+same-message tools run. Provider-native `FsVersion` values are deliberately not
+reused as Git blob observations; a read-capable plugin with exact b2f version
+information may instead call `ctx.b2f.recordObservation(agentId, {...})`.
 
 ```yaml
 # in your preset or overlay cordis.yml
