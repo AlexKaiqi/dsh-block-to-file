@@ -10,6 +10,8 @@ import type {
   B2FFailedReport,
   B2FPreconditionFailedReport,
   B2FProjectionFailedReport,
+  B2FPublicationFailedReport,
+  B2FPublicationReceipt,
   B2FReport,
   B2FStaleReport,
   B2FUnchangedReport,
@@ -19,12 +21,15 @@ import type {
 
 /** Render one committed transaction. */
 export function renderSuccessFeedback(report: B2FCommittedReport): string {
-  return renderResults(`[b2f] committed ${report.commit}`, report.results)
+  return appendPublications(renderResults(`[b2f] committed ${report.commit}`, report.results), report.publications)
 }
 
 /** Render an all-no-op transaction. */
 export function renderUnchangedFeedback(report: B2FUnchangedReport): string {
-  return renderResults(`[b2f] unchanged; no commit was created.\nrepoRevision: ${report.repoRevision}`, report.results)
+  return appendPublications(
+    renderResults(`[b2f] unchanged; no commit was created.\nrepoRevision: ${report.repoRevision}`, report.results),
+    report.publications,
+  )
 }
 
 function renderResults(prefix: string, results: readonly MaterializeResult[]): string {
@@ -36,6 +41,13 @@ function renderResults(prefix: string, results: readonly MaterializeResult[]): s
     }
   }
   return lines.join('\n')
+}
+
+function appendPublications(text: string, publications?: readonly B2FPublicationReceipt[]): string {
+  if (publications === undefined || publications.length === 0) return text
+  const lines = publications.map(publication =>
+    `[b2f] published ${publication.scope} revision ${publication.revision}${publication.noOp ? ' (unchanged)' : ''}`)
+  return `${text}\n${lines.join('\n')}`
 }
 
 function renderResultLine(result: MaterializeResult): string {
@@ -134,6 +146,14 @@ export function renderProjectionFailureFeedback(report: B2FProjectionFailedRepor
   return `[b2f] projection failed at canonical revision ${report.repoRevision}; tool execution is blocked.\n${detail}`
 }
 
+export function renderPublicationFailureFeedback(report: B2FPublicationFailedReport): string {
+  const local = report.commit === null
+    ? `workspace revision ${report.repoRevision} was unchanged`
+    : `workspace commit ${report.commit} succeeded`
+  const detail = report.errors.map(error => error.hint).join('; ')
+  return `[b2f] external publication failed after ${local}; tool execution is blocked.\n${detail}`
+}
+
 /**
  * Render one content echo as an INERT block.
  *
@@ -185,6 +205,7 @@ export function renderFeedback(report: B2FReport, numbered = false): string {
     case 'edit-unresolved': return renderEditUnresolvedFeedback(report, numbered)
     case 'failed': return renderFailureFeedback(report)
     case 'projection-failed': return renderProjectionFailureFeedback(report)
+    case 'publication-failed': return renderPublicationFailureFeedback(report)
   }
 }
 
