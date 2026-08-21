@@ -16,8 +16,12 @@ import type { TransactionConfig } from './transaction.ts'
 import type { B2FReport, FileObservation } from './types.ts'
 import type { ValidatedFileBlock } from './validator.ts'
 
-/** Signature of a deployment-supplied per-run root resolver. */
-export type B2FRootResolver = (agent?: Agent, session?: Session) => string
+/** Signature of a deployment-supplied path-aware root resolver. */
+export type B2FRootResolver = (
+  agent?: Agent,
+  session?: Session,
+  paths?: readonly string[],
+) => string | undefined
 
 export interface B2FCommitConfig {
   readonly canonicalRef: string
@@ -40,28 +44,62 @@ declare module '@deepseek-ai/cordis' {
 
 /** Standalone b2f service registered as `ctx.b2f`. */
 export class B2FService extends Service {
-  private resolver: B2FRootResolver
+  private readonly fallbackResolver: (agent?: Agent, session?: Session) => string
+  private readonly resolvers: Array<{ readonly resolve: B2FRootResolver }> = []
   private readonly snapshots = new Map<string, AgentSnapshot>()
   private readonly observations = new Map<string, Map<string, FileObservation>>()
 
   constructor(ctx: Context, fallbackRoot: string) {
     super(ctx, 'b2f')
-    this.resolver = (_agent, session) => session?.header.cwd ?? fallbackRoot
+    this.fallbackResolver = (_agent, session) => session?.header.cwd ?? fallbackRoot
+    ctx.on('agent/disposed', ({ agent }) => {
+      this.releaseAgent(String(agent.id))
+    })
   }
 
-  /** Install a generic synchronous resolver for per-agent checkouts or sandboxes. */
-  setRootResolver(resolver: B2FRootResolver): void {
-    this.resolver = resolver
+  /**
+   * Register a synchronous resolver for per-agent checkouts or sandboxes.
+   *
+   * The newest live registration wins. The returned disposer removes exactly
+   * this registration, so independently mounted consumers unwind correctly.
+   */
+  registerRootResolver(resolver: B2FRootResolver): () => void {
+    const entry = { resolve: resolver }
+    this.resolvers.push(entry)
+    return () => {
+      const index = this.resolvers.lastIndexOf(entry)
+      if (index >= 0) this.resolvers.splice(index, 1)
+    }
+  }
+
+  /** @deprecated Use `registerRootResolver()` and retain its disposer. */
+  setRootResolver(resolver: B2FRootResolver): () => void {
+    return this.registerRootResolver(resolver)
   }
 
   /** Resolve the repository worktree root for one pipeline run. */
-  resolveRoot(agent?: Agent, session?: Session): string {
-    return this.resolver(agent, session)
+  resolveRoot(agent?: Agent, session?: Session, paths?: readonly string[]): string {
+    for (let index = this.resolvers.length - 1; index >= 0; index -= 1) {
+      const root = this.resolvers[index]?.resolve(agent, session, paths)
+      if (root !== undefined) return root
+    }
+    return this.fallbackResolver(agent, session)
+  }
+
+  /** Release all observation state owned by one disposed Agent. */
+  releaseAgent(agentId: string): void {
+    this.snapshots.delete(agentId)
+    this.observations.delete(agentId)
   }
 
   /** Capture the canonical repository snapshot visible to the next model step. */
-  captureSnapshot(agent: Agent, session: Session, canonicalRef: string, tempFileKeep = 16): string {
-    const root = this.resolveRoot(agent, session)
+  captureSnapshot(
+    agent: Agent,
+    session: Session,
+    canonicalRef: string,
+    tempFileKeep = 16,
+    root = this.resolveRoot(agent, session),
+  ): string {
     const previous = this.snapshots.get(agent.id)
     if (previous?.root === root) return previous.repoRevision
 
@@ -88,11 +126,11 @@ export class B2FService extends Service {
     session: Session,
     validated: readonly ValidatedFileBlock[],
     config: B2FCommitConfig,
+    root = this.resolveRoot(agent, session, validated.map(entry => entry.normalizedPath)),
   ): B2FReport {
-    const root = this.resolveRoot(agent, session)
     let snapshot = this.snapshots.get(agent.id)
     if (snapshot === undefined || snapshot.root !== root) {
-      const repoRevision = this.captureSnapshot(agent, session, config.canonicalRef, config.tempFileKeep)
+      const repoRevision = this.captureSnapshot(agent, session, config.canonicalRef, config.tempFileKeep, root)
       snapshot = { root, repoRevision }
     }
     const explicit = this.observations.get(agent.id)

@@ -25,7 +25,7 @@ export const DEFAULT_PROMPT = [
   '    print("hello")',
   '```',
   '',
-  'Never add file= to example code blocks that are only for display.',
+  'Never add file= to example code blocks that are only for display; wrap protocol examples in a longer ordinary fence so they remain inert.',
   'One block per path per message. Blocks labelled path= in [b2f] feedback are read-only echoes; never copy them back as-is.',
 ].join('\n')
 

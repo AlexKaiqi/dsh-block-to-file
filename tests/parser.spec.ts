@@ -16,6 +16,11 @@ describe('parseFileBlocks', () => {
     expect(blocks).toHaveLength(0)
   })
 
+  it('keeps file-fence examples inside display fences inert', () => {
+    const text = '````markdown\n```ts file=example.ts\nexport const value = 1\n```\n````\n'
+    expect(parseFileBlocks(text)).toEqual({ blocks: [], errors: [] })
+  })
+
   it('parses optional attributes and language tag', () => {
     const { blocks } = parseFileBlocks('```python file=src/app.py mode=create diff=none newline=lf\nx\n```\n')
     expect(blocks[0]).toMatchObject({
