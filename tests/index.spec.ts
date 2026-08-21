@@ -250,6 +250,65 @@ describe('block-to-file plugin', () => {
     expect(result.content).toEqual([
       { type: 'text', text: expect.stringContaining('[b2f] file transaction failed') },
     ])
+
+    const nested = await ctx.tools.execute({
+      signal: new AbortController().signal,
+      callId: CallId('call-1:nested'),
+      rootCallId: CallId('call-1'),
+      name: 'noop',
+      arguments: {},
+      agent,
+    })
+    expect(nested.isError).toBe(true)
+
+    const unrelated = await ctx.tools.execute({
+      signal: new AbortController().signal,
+      callId: CallId('call-2'),
+      name: 'noop',
+      arguments: {},
+      agent,
+    })
+    expect(unrelated.isError).toBe(false)
+  })
+
+  it('allows same-message tools when every file block is unchanged', async () => {
+    const root = makeRoot()
+    writeFileSync(join(root, 'stable.txt'), 'stable\n')
+    execFileSync('git', ['add', 'stable.txt'], { cwd: root })
+    execFileSync('git', ['commit', '--quiet', '-m', 'seed'], { cwd: root, env: gitEnv() })
+    const ctx = await setup(root)
+    const agent = makeAgent(ctx, 'b2f-plugin-tool-unchanged', root, () => {})
+    ctx.tools.register(defineTool({
+      name: 'noop',
+      description: 'noop',
+      parameters: {},
+      output: { schema: { type: 'string' }, render: (_args, value) => [{ type: 'text', text: value }] },
+      async execute() { return 'ok' },
+    }))
+
+    agent.session.append('assistant/message', {
+      turn: 1,
+      step: 1,
+      message: {
+        id: MessageId('msg-unchanged-tool'),
+        role: 'assistant',
+        content: [
+          textBlock('```text file=stable.txt\nstable\n```\n'),
+          { type: 'tool-call', id: CallId('call-unchanged'), name: 'noop', arguments: '{}' },
+        ],
+        source: { kind: 'model', provider: 'test', model: 'test' },
+      },
+    }, { surfaceOp: 'append' })
+    await Promise.resolve()
+
+    const result = await ctx.tools.execute({
+      signal: new AbortController().signal,
+      callId: CallId('call-unchanged'),
+      name: 'noop',
+      arguments: {},
+      agent,
+    })
+    expect(result.isError).toBe(false)
   })
 
   it('applies the configured default newline when a block omits newline=', async () => {
@@ -298,9 +357,16 @@ describe('block-to-file plugin', () => {
   it('resolves a per-session root through ctx.b2f', async () => {
     const root = makeRoot()
     const ctx = await setup(root)
+    const intermediate = makeRoot()
     const dynamic = makeRoot()
-    ctx.b2f.setRootResolver(() => dynamic)
     const agent = makeAgent(ctx, 'b2f-plugin-dynamic-root', root, () => {})
+    const disposeIntermediate = ctx.b2f.registerRootResolver(() => intermediate)
+    const disposeDynamic = ctx.b2f.registerRootResolver(() => dynamic)
+
+    expect(ctx.b2f.resolveRoot(agent, agent.session)).toBe(dynamic)
+    disposeDynamic()
+    expect(ctx.b2f.resolveRoot(agent, agent.session)).toBe(intermediate)
+    const disposeRestored = ctx.b2f.registerRootResolver(() => dynamic)
 
     agent.session.append('assistant/message', {
       turn: 1,
@@ -316,6 +382,51 @@ describe('block-to-file plugin', () => {
 
     expect(readFileSync(join(dynamic, 'dynamic.txt'), 'utf8')).toBe('dynamic\n')
     expect(existsSync(join(root, 'dynamic.txt'))).toBe(false)
+    disposeRestored()
+    disposeIntermediate()
+    expect(ctx.b2f.resolveRoot(agent, agent.session)).toBe(root)
+  })
+
+  it('lets a selective resolver claim only matching file paths', async () => {
+    const root = makeRoot()
+    const scoped = makeRoot()
+    const ctx = await setup(root)
+    const agent = makeAgent(ctx, 'b2f-plugin-selective-root', root, () => {})
+    const dispose = ctx.b2f.registerRootResolver((_agent, _session, paths) =>
+      paths !== undefined && paths.length > 0 && paths.every(path => path.startsWith('work/')) ? scoped : undefined)
+
+    expect(ctx.b2f.resolveRoot(agent, agent.session)).toBe(root)
+    expect(ctx.b2f.resolveRoot(agent, agent.session, ['source.ts'])).toBe(root)
+    expect(ctx.b2f.resolveRoot(agent, agent.session, ['work/root/surface.md'])).toBe(scoped)
+
+    appendAssistant(agent, 'msg-selective-root', '```text file=work/root/surface.md\nscoped\n```\n')
+    await Promise.resolve()
+
+    expect(readFileSync(join(scoped, 'work/root/surface.md'), 'utf8')).toBe('scoped\n')
+    expect(existsSync(join(root, 'work/root/surface.md'))).toBe(false)
+    dispose()
+  })
+
+  it('releases Agent observations when the Agent is disposed', async () => {
+    const root = makeRoot()
+    const ctx = await setup(root)
+    const agent = makeAgent(ctx, 'b2f-plugin-disposed', root, () => {})
+    const repoRevision = ctx.b2f.captureSnapshot(agent, agent.session, 'refs/heads/agent-canonical')
+    ctx.b2f.recordObservation(agent.id, {
+      path: 'observed.txt',
+      fileVersion: 'absent',
+      repoRevision,
+    })
+
+    const internals = ctx.b2f as unknown as {
+      snapshots: Map<string, unknown>
+      observations: Map<string, unknown>
+    }
+    expect(internals.snapshots.has(agent.id)).toBe(true)
+    expect(internals.observations.has(agent.id)).toBe(true)
+    ctx.emit('agent/disposed', { agent })
+    expect(internals.snapshots.has(agent.id)).toBe(false)
+    expect(internals.observations.has(agent.id)).toBe(false)
   })
 
   it('returns stale content and treats it as the next observation', async () => {
@@ -484,6 +595,26 @@ describe('block-to-file plugin', () => {
       editsApplied: 1,
       fuzz: 0,
     })
+  })
+
+  it('contains transaction observer failures after publication', async () => {
+    const root = makeRoot()
+    const ctx = await setup(root)
+    const injected: UserMessage[] = []
+    ctx.on('b2f/transaction', () => {
+      throw new Error('observer failed')
+    })
+    const agent = makeAgent(ctx, 'b2f-plugin-observer-failure', root, message => injected.push(message))
+
+    expect(() => appendAssistant(
+      agent,
+      'msg-observer-failure',
+      '```text file=committed.txt\ncommitted\n```\n',
+    )).not.toThrow()
+    await Promise.resolve()
+
+    expect(readFileSync(join(root, 'committed.txt'), 'utf8')).toBe('committed\n')
+    expect(feedbackText(injected[0]!)).toContain('[b2f] committed')
   })
 
   it('numbers echoed content only for the line-anchored dialect', async () => {

@@ -152,8 +152,8 @@ pnpm build
 dsh plugin --profile web add "$PWD"
 ```
 
-Mount the plugin beside your agent composition (for example in a preset or an
-overlay `cordis.patch.yml`):
+Mount the plugin in the Host composition, where its `b2f` service can be shared
+by every Agent session:
 
 ```yaml
 - id: block-to-file
@@ -162,19 +162,31 @@ overlay `cordis.patch.yml`):
     root: $WS
 ```
 
+Do not mount this service provider as a loose row in an Agent preset. A preset
+that owns b2f must isolate the `b2f` service and place every consumer in that
+same isolate realm.
+
 b2f replaces the model-facing `str_replace_editor` write path. Remove or
 disable the official editor in YOUR composition (preset / overlay) — this
 package intentionally does not patch or remove any official plugin.
 
-For generic per-agent checkouts or sandboxes, install a root resolver at
-activation time:
+For generic per-agent checkouts or sandboxes, install a path-aware root
+resolver at activation time and retain its Fiber-scoped disposer. Return
+`undefined` for paths the resolver does not own so older registrations or the
+default Session workspace can handle them:
 
 ```ts
-ctx.b2f.setRootResolver((agent, session) => checkoutRootFor(agent, session))
+const dispose = ctx.b2f.registerRootResolver(
+  (agent, session, paths) => paths?.every(isCheckoutPath)
+    ? checkoutRootFor(agent, session)
+    : undefined,
+)
+ctx.effect(() => dispose)
 ```
 
-The default resolver uses `session.header.cwd`, falling back to the static
-`config.root` / `$WS` / `$DSH_B2F_ROOT` value. b2f pins an agent's canonical
+The newest resolver returning a root wins. The default resolver uses
+`session.header.cwd`, falling back to the static `config.root` / `$WS` /
+`$DSH_B2F_ROOT` value. b2f pins an agent's canonical
 snapshot when its
 repository view is first prepared and advances it only after commit or stale
 feedback. A read-capable plugin with exact path information may replace the

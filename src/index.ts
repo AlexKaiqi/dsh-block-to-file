@@ -24,7 +24,7 @@ import { renderFeedback as renderB2FFeedback } from './feedback.ts'
 import { DEFAULT_MAX_DRIFT } from './edit.ts'
 import { buildPrompt, DEFAULT_PROMPT } from './model/prompt.ts'
 import { B2FService as B2FServiceClass } from './service.ts'
-import type { B2FError, B2FReport, EditFormat, StepB2FState } from './types.ts'
+import type { B2FError, B2FReport, EditFormat } from './types.ts'
 
 export { parseFileBlocks } from './parser.ts'
 export type { ParseResult } from './parser.ts'
@@ -136,7 +136,8 @@ export function apply(ctx: Context, config: Config): void {
   assertTmpOutside(resolveGitDir(resolved.root), resolved.root)
   sweepTempDir(defaultTmp, resolved.tempFileKeep)
   new B2FServiceClass(ctx, resolved.root)
-  const state = new Map<string, StepB2FState>()
+  const deniedCalls = new Map<string, string>()
+  const callsByStep = new Map<string, readonly string[]>()
 
   ctx.systemPrompt.section({
     name: 'b2f:write-files',
@@ -150,10 +151,22 @@ export function apply(ctx: Context, config: Config): void {
     return next()
   })
 
+  ctx.on('agent/disposed', ({ agent }) => {
+    const prefix = `${agent.id}:`
+    for (const key of deniedCalls.keys()) {
+      if (key.startsWith(prefix)) deniedCalls.delete(key)
+    }
+    for (const key of callsByStep.keys()) {
+      if (key.startsWith(prefix)) callsByStep.delete(key)
+    }
+  })
+
   // Parse, validate, compare, and publish synchronously before same-message tools.
   ctx.on('session/event', (session: Session, event: SessionEvent) => {
     if (event.type === 'step/end') {
-      state.delete(stateKey(session.id, event.data.turn, event.data.step))
+      const stepKey = stateKey(session.id, event.data.turn, event.data.step)
+      for (const key of callsByStep.get(stepKey) ?? []) deniedCalls.delete(key)
+      callsByStep.delete(stepKey)
       return
     }
     if (event.type !== 'assistant/message') return
@@ -165,26 +178,37 @@ export function apply(ctx: Context, config: Config): void {
     // Line-anchored dialects need numbered echoes so the model can re-anchor;
     // content-anchored ones need verbatim text to copy.
     const feedback = renderB2FFeedback(report, resolved.editFormat === 'git_diff')
-    const key = stateKey(session.id, event.data.turn, event.data.step)
-    state.set(key, { turn: event.data.turn, step: event.data.step, report, feedback })
-    ctx.emit('b2f/transaction', session, report)
+    if (!report.ok) {
+      const callKeys = event.data.message.content
+        .filter((block): block is Extract<ContentBlock, { type: 'tool-call' }> => block.type === 'tool-call')
+        .map(block => callKey(session.id, block.id))
+      for (const key of callKeys) deniedCalls.set(key, report.status)
+      if (callKeys.length > 0) {
+        callsByStep.set(stateKey(session.id, event.data.turn, event.data.step), callKeys)
+      }
+    }
+    try {
+      ctx.emit('b2f/transaction', session, report)
+    } catch {
+      // Observation failures cannot change an already settled transaction.
+    }
 
     queueMicrotask(() => {
       injectFeedback(agent, feedback)
     })
   })
 
-  // A tool may observe proposed files only after their whole transaction commits.
+  // Only tool calls emitted beside a failed transaction are denied. Correlating
+  // by rootCallId also covers nested Code Mode dispatch without leaking failure
+  // state into a later model step.
   ctx.on('tools/pre-execute', async (exec: ToolExecution, next: () => Promise<PreToolDecision>): Promise<PreToolDecision> => {
     const agent = exec.agent
     if (agent === undefined) return next()
-    const current = currentAssistant(agent)
-    if (current === undefined) return next()
-    const stepState = state.get(stateKey(agent.id, current.turn, current.step))
-    if (stepState !== undefined && stepState.report.status !== 'committed') {
+    const status = deniedCalls.get(callKey(agent.id, exec.rootCallId))
+    if (status !== undefined) {
       return {
         kind: 'deny',
-        reason: `[b2f] file transaction ${stepState.report.status}; see the [b2f] feedback before retrying.`,
+        reason: `[b2f] file transaction ${status}; see the [b2f] feedback before retrying.`,
       }
     }
     return next()
@@ -216,7 +240,8 @@ function runPipeline(
       hint: 'emit valid UTF-8 text only (no unpaired surrogate code points)',
     }])
   }
-  const root = service.resolveRoot(agent, session)
+  const paths = parsed.blocks.map(block => block.path)
+  const root = service.resolveRoot(agent, session, paths)
   const validation = validateBlocks(parsed.blocks, {
     root,
     maxFileSize: config.maxFileSize,
@@ -234,7 +259,7 @@ function runPipeline(
     tempFileKeep: config.tempFileKeep,
     maxCasRetries: config.maxCasRetries,
     maxEditDrift: config.maxEditDrift,
-  })
+  }, root)
 }
 
 function failedReport(errors: readonly B2FError[]): B2FReport {
@@ -340,11 +365,8 @@ function stateKey(sessionId: string, turn: number, step: number): string {
   return `${sessionId}:${turn}:${step}`
 }
 
-/** Find the assistant message event owning the current step. */
-function currentAssistant(agent: Agent): { turn: number; step: number } | undefined {
-  const event = [...agent.session.events].reverse().find(event => event.type === 'assistant/message')
-  if (event?.type !== 'assistant/message') return undefined
-  return { turn: event.data.turn, step: event.data.step }
+function callKey(sessionId: string, callId: string): string {
+  return `${sessionId}:${callId}`
 }
 
 /** Inject `[b2f]` feedback into the next step without waking an idle driver. */

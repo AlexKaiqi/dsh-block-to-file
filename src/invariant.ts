@@ -14,14 +14,10 @@ export const name = 'block-to-file-invariant'
 /** Service required before the companion can reserve package ownership. */
 export const inject = ['invariants']
 
-/**
- * No session-log invariant: b2f's durable state is a linear canonical Git ref
- * whose parent relation and compare-and-swap publication are enforced by the
- * plugin's transaction implementation.
- * @param _ctx - registrant context (unused; kept for the Cordis plugin face).
- * @returns an empty installer reservation for package ownership.
- */
-export function apply(_ctx: Context): InvariantInstaller | undefined {
-  void PACKAGE_NAME
-  return undefined
-}
+// No runtime check: b2f's linear Git ref and CAS publication are covered by
+// transaction integration tests. The empty installer still reserves ownership.
+const install: InvariantInstaller = () => {}
+
+/** Register this package's invariant companion. */
+export const apply = (ctx: Context): Promise<() => void> =>
+  Promise.resolve(ctx.invariants.register(PACKAGE_NAME, install))

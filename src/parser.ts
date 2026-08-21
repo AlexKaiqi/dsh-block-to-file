@@ -54,7 +54,9 @@ export function parseFileBlocks(text: string, defaultNewline: FileBlockNewline =
     const info = line.slice(fence.infoStart).trimEnd()
     const parsed = parseInfoString(info)
     if (!parsed.attrs.has('file')) {
-      pos = nextPos
+      // A display-only fence is opaque. In particular, documentation examples
+      // containing an inner `file=` fence must not become write instructions.
+      pos = skipToClosingFence(text, nextPos, fence.markerLength)
       continue
     }
 

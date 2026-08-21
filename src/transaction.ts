@@ -88,7 +88,6 @@ interface SnapshotEntry {
 
 const BOOTSTRAP_REF = 'refs/b2f/bootstrap'
 const ZERO_OID = '0000000000000000000000000000000000000000'
-const readyGitDirs = new Set<string>()
 
 /** Resolve the current canonical commit, initializing the ref from the managed baseline once. */
 export function resolveCanonicalRevision(root: string, canonicalRef: string): string {
@@ -689,7 +688,10 @@ function ensureManagedRepository(root: string): void {
   mkdirSync(root, { recursive: true })
   const gitDir = resolveGitDir(root)
   assertTempDirOutsideRoot(gitDir, root)
-  if (readyGitDirs.has(gitDir) && existsSync(join(gitDir, 'HEAD'))) return
+  if (existsSync(join(gitDir, 'HEAD'))
+    && tryGit(root, ['rev-parse', '--verify', BOOTSTRAP_REF]) !== null) {
+    return
+  }
 
   mkdirSync(dirname(gitDir), { recursive: true })
   if (!existsSync(join(gitDir, 'HEAD'))) {
@@ -708,7 +710,6 @@ function ensureManagedRepository(root: string): void {
     tryGit(root, ['update-ref', BOOTSTRAP_REF, commit, ZERO_OID])
     git(root, ['rev-parse', '--verify', BOOTSTRAP_REF])
   }
-  readyGitDirs.add(gitDir)
 }
 
 /** Capture the current workspace without descending into nested `.git` stores. */
