@@ -4,7 +4,7 @@
  * common prefix/suffix lines are stripped first, then the middle is diffed
  * with an LCS table when small enough, or emitted as one remove/add hunk.
  *
- * @module @deepseek-ai/dsh-block-to-file
+ * @module dsh-block-to-file
  */
 
 /* oxlint-disable typescript/no-non-null-assertion -- LCS table rows are preallocated and indexed in bounds */

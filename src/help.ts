@@ -9,7 +9,7 @@
  * `VERSION` tracks the package version and is asserted equal to it by the
  * contract tests, so the protocol surface cannot silently drift from a release.
  *
- * @module @deepseek-ai/dsh-block-to-file
+ * @module dsh-block-to-file
  */
 
 /** Package version; kept in lockstep with package.json by contract test. */
@@ -24,7 +24,7 @@ export const PROTOCOL_VERSION = '1.0.0'
  * Partial-edit forms are listed for completeness; a deployment exposes exactly
  * one of them, chosen by `editFormat`, and rejects the other.
  */
-export const HELP = `b2f block protocol ${PROTOCOL_VERSION} (@deepseek-ai/dsh-block-to-file ${VERSION})
+export const HELP = `b2f block protocol ${PROTOCOL_VERSION} (dsh-block-to-file ${VERSION})
 
 Blocks are written in assistant messages, not called as a tool. Every block in
 one message commits together, before any tool call in that message runs.

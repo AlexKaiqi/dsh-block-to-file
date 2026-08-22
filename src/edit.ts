@@ -11,7 +11,7 @@
  * clean/smudge filter, `core.autocrlf`, or `apply.whitespace` setting can
  * silently transform content on the way in.
  *
- * @module @deepseek-ai/dsh-block-to-file
+ * @module dsh-block-to-file
  */
 
 import { b2fError } from './errors.ts'

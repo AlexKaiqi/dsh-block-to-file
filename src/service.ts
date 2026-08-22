@@ -5,7 +5,7 @@
  * root resolver is a generic checkout/sandbox facility; no downstream plugin
  * participates in b2f's Git concurrency semantics.
  *
- * @module @deepseek-ai/dsh-block-to-file
+ * @module dsh-block-to-file
  */
 
 import { isAbsolute, relative, resolve as resolvePath } from 'node:path'

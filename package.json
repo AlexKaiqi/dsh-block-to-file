@@ -1,5 +1,5 @@
 {
-  "name": "@deepseek-ai/dsh-block-to-file",
+  "name": "dsh-block-to-file",
   "description": "block-to-file runtime plugin: atomically commits fenced file blocks with Git blob observations, multi-file transactions, and ref CAS",
   "version": "0.1.0-rc.6",
   "license": "MIT",
@@ -8,9 +8,15 @@
   "engines": {
     "node": "^22.19.0 || >=24.0.0"
   },
-  "publishConfig": {
-    "access": "public"
-  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "cordis",
+    "block-to-file",
+    "agent",
+    "git",
+    "file-editing"
+  ],
   "repository": {
     "type": "git",
     "url": "git+https://github.com/AlexKaiqi/dsh-block-to-file.git"

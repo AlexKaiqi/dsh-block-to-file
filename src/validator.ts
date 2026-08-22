@@ -2,7 +2,7 @@
  * Pure validation for parsed file blocks. Validation performs checks only;
  * no directory or file is created or modified here.
  *
- * @module @deepseek-ai/dsh-block-to-file
+ * @module dsh-block-to-file
  */
 
 import { posix } from 'node:path'

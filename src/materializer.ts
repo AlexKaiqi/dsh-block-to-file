@@ -6,7 +6,7 @@
  * b2f scratch state. The staging directory itself is resolved and policed here;
  * `transaction.ts` owns the writes that use it.
  *
- * @module @deepseek-ai/dsh-block-to-file
+ * @module dsh-block-to-file
  */
 
 import { readdirSync, rmSync, statSync } from 'node:fs'

@@ -1,13 +1,13 @@
 /**
- * Package-owned invariant companion for `@deepseek-ai/dsh-block-to-file`.
- * @module @deepseek-ai/dsh-block-to-file/invariant
+ * Package-owned invariant companion for `dsh-block-to-file`.
+ * @module dsh-block-to-file/invariant
  */
 
 /* jscpd:ignore-start */
 import type { Context } from '@deepseek-ai/cordis'
 import type { InvariantInstaller } from '@deepseek-ai/dsh-invariants'
 
-const PACKAGE_NAME = '@deepseek-ai/dsh-block-to-file'
+const PACKAGE_NAME = 'dsh-block-to-file'
 
 /** Cordis companion plugin name. */
 export const name = 'block-to-file-invariant'

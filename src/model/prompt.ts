@@ -6,7 +6,7 @@
  * Exactly one edit dialect is composed into the assembled prompt, so the model
  * never has to decide which patch format to use.
  *
- * @module @deepseek-ai/dsh-block-to-file
+ * @module dsh-block-to-file
  */
 
 import type { EditFormat } from '../types.ts'
