@@ -12,7 +12,7 @@ describe('block-to-file invariant companion', () => {
     const fiber = await ctx.plugin(BlockToFileInvariant)
 
     expect(register).toHaveBeenCalledWith(
-      '@deepseek-ai/dsh-block-to-file',
+      'dsh-block-to-file',
       expect.any(Function),
     )
     await fiber.dispose()

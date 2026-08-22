@@ -11,7 +11,7 @@
  * Every error carries an executable next step in `hint`, sourced from
  * `ERROR_HINTS`, so a refusal always names what to do instead.
  *
- * @module @deepseek-ai/dsh-block-to-file
+ * @module dsh-block-to-file
  */
 
 import { ERROR_HINTS, type B2FError, type B2FErrorCode } from './types.ts'

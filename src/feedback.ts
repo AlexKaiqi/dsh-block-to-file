@@ -1,6 +1,6 @@
 /**
  * Renders `[b2f]` feedback strings for the model from transactional reports.
- * @module @deepseek-ai/dsh-block-to-file
+ * @module dsh-block-to-file
  */
 
 import type {

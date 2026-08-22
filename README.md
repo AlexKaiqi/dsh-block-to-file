@@ -1,4 +1,4 @@
-# @deepseek-ai/dsh-block-to-file
+# dsh-block-to-file
 
 Model-facing **block-to-file (b2f)** runtime pipeline plugin.
 
@@ -146,8 +146,8 @@ pnpm check
 Install from npm and add the package to the DSH profile:
 
 ```sh
-npm install @deepseek-ai/dsh-block-to-file
-dsh plugin --profile web add @deepseek-ai/dsh-block-to-file
+npm install dsh-block-to-file
+dsh plugin --profile web add dsh-block-to-file
 ```
 
 During local development, link this checkout instead (`pnpm install && pnpm
@@ -158,7 +158,7 @@ by every Agent session:
 
 ```yaml
 - id: block-to-file
-  name: '@deepseek-ai/dsh-block-to-file'
+  name: 'dsh-block-to-file'
   config:
     root: $WS
 ```

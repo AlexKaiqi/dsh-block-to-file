@@ -1,6 +1,6 @@
 /**
  * Shared vocabulary for the block-to-file (b2f) runtime pipeline.
- * @module @deepseek-ai/dsh-block-to-file
+ * @module dsh-block-to-file
  */
 
 /** Valid block materialization modes. */

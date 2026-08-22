@@ -6,7 +6,7 @@
  * syntax errors are collected per block and reported together with validation
  * errors by the pipeline.
  *
- * @module @deepseek-ai/dsh-block-to-file
+ * @module dsh-block-to-file
  */
 
 import { ERROR_HINTS, type B2FError, type FileBlock, type FileBlockNewline } from './types.ts'

@@ -7,7 +7,7 @@
  * publishes one commit with ref CAS, injects `[b2f]` feedback, and denies tool
  * execution unless the whole transaction committed.
  *
- * @module @deepseek-ai/dsh-block-to-file
+ * @module dsh-block-to-file
  */
 
 import { isAbsolute, resolve } from 'node:path'
