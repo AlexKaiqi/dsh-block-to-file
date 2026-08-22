@@ -170,11 +170,20 @@ export class B2FService extends Service {
     return []
   }
 
-  /** Resolve a root synchronously for compatibility and pre-step snapshots. */
+  /**
+   * Resolve a root synchronously for compatibility and pre-step snapshots.
+   * Roots that need asynchronous preparation must go through {@link resolveScope}
+   * instead; synchronous callers that cannot await it (pre-step snapshots) skip
+   * the snapshot and let the commit path capture it on demand.
+   */
   resolveRoot(agent?: Agent, session?: Session, paths?: readonly string[]): string {
     const scope = this.resolveScope(agent, session, paths)
     if (isPromiseLike(scope)) {
-      throw new BlockToFileError('MATERIALIZE_FAILED', null, 'this root requires asynchronous preparation.')
+      throw new BlockToFileError(
+        'MATERIALIZE_FAILED',
+        null,
+        'this root requires asynchronous preparation; resolve the scope through the async path before committing.',
+      )
     }
     return scope.root
   }
