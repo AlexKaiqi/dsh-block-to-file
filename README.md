@@ -143,14 +143,15 @@ pnpm check
 
 ## Usage
 
-Until the package is published, build it from this checkout and add the local
-directory to the DSH profile:
+Install from npm and add the package to the DSH profile:
 
 ```sh
-pnpm install
-pnpm build
-dsh plugin --profile web add "$PWD"
+npm install @deepseek-ai/dsh-block-to-file
+dsh plugin --profile web add @deepseek-ai/dsh-block-to-file
 ```
+
+During local development, link this checkout instead (`pnpm install && pnpm
+build`, then `dsh plugin --profile web add "$PWD"`).
 
 Mount the plugin in the Host composition, where its `b2f` service can be shared
 by every Agent session:
@@ -205,11 +206,13 @@ ctx.effect(() => disposePublisher)
 Every path is resolved independently. If one message spans more than one root
 or named scope, the whole transaction fails with `MIXED_ROOT_SCOPE`. Resolvers
 may prepare a scope asynchronously. The newest resolver returning a claim wins.
-When `ctx.sandboxPolicy` is mounted, b2f consumes that same per-Session policy:
-`read-only` rejects every mutation, `workspace-write` accepts the Session root
-and trusted `mounted-workspace` claims, and `danger-full-access` retains the
-configured b2f boundary. The default resolver uses
-`session.header.cwd`, falling back to the static `config.root` / `$WS` /
+Roots that need asynchronous preparation are skipped by the pre-step snapshot
+and captured on demand at commit time, so an async resolver never fails an
+agent step. When `ctx.sandboxPolicy` is mounted, b2f consumes that same
+per-Session policy: `read-only` rejects every mutation, `workspace-write`
+accepts the Session root and trusted `mounted-workspace` claims, and
+`danger-full-access` retains the configured b2f boundary. The default resolver
+uses `session.header.cwd`, falling back to the static `config.root` / `$WS` /
 `$DSH_B2F_ROOT` value. b2f pins an agent's canonical snapshot when its
 repository view is first prepared and advances it only after commit or stale
 feedback. When `ctx.fs` is mounted, a successful b2f settlement resolves and
