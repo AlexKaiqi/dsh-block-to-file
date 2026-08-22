@@ -47,6 +47,10 @@ export { EDIT_MODE_FOR_FORMAT } from './types.ts'
 export type { B2FCommittedReport, B2FEditUnresolvedReport, B2FError, B2FErrorCode, B2FFailedReport, B2FPreconditionFailedReport, B2FProjectionFailedReport, B2FPublicationFailedReport, B2FPublicationReceipt, B2FReport, B2FStaleReport, B2FUnchangedReport, B2FWorktreeDirtyReport, ChangeSinceRead, DirtyFile, EditFormat, FileBlock, FileBlockDiff, FileBlockEncoding, FileBlockMode, FileBlockNewline, FileObservation, FileVersion, MaterializeResult, MaterializeStatus, PreconditionFile, StaleFile, StepB2FState } from './types.ts'
 
 export const name = 'block-to-file'
+// `tools` is a hard dependency on purpose: b2f gates same-message tool
+// execution through `tools/pre-execute`, so activating before the tool runtime
+// is ready would silently disable that gate. `agents` is required to correlate
+// sessions, and `systemPrompt` to mount the protocol section.
 export const inject = ['systemPrompt', 'tools', 'agents']
 
 declare module '@deepseek-ai/cordis' {
@@ -148,7 +152,14 @@ export function apply(ctx: Context, config: Config): void {
 
   // Capture the immutable repository view on which the next model decision is based.
   ctx.on('agent/pre-step', async (payload, next) => {
-    ctx.b2f.captureSnapshot(payload.agent, payload.agent.session, resolved.canonicalRef, resolved.tempFileKeep)
+    try {
+      ctx.b2f.captureSnapshot(payload.agent, payload.agent.session, resolved.canonicalRef, resolved.tempFileKeep)
+    } catch (error: unknown) {
+      // A root that needs asynchronous preparation cannot snapshot here. The
+      // commit path captures the snapshot on demand, so failing a whole agent
+      // step over an optimization would be wrong — log and move on.
+      ctx.logger.warn('[b2f] pre-step snapshot skipped: %s', error instanceof Error ? error.message : String(error))
+    }
     return next()
   })
 
@@ -197,6 +208,11 @@ export function apply(ctx: Context, config: Config): void {
         // Observation failures cannot change an already settled transaction.
       }
       injectFeedback(agent, feedback)
+    }, (error: unknown) => {
+      // Defensive: settlement never rejects today because every publication
+      // path is caught, but an unexpected rejection must not surface as an
+      // unhandled rejection or silently drop the model-facing feedback.
+      ctx.logger.warn('[b2f] transaction settlement rejected: %s', error instanceof Error ? error.message : String(error))
     })
   })
 
@@ -208,7 +224,18 @@ export function apply(ctx: Context, config: Config): void {
     if (agent === undefined) return next()
     const settlement = settlements.get(callKey(agent.id, exec.rootCallId))
     if (settlement === undefined) return next()
-    const report = await settlement
+    let report: B2FReport
+    try {
+      report = await settlement
+    } catch (error: unknown) {
+      // Fail closed: an unexpected settlement failure must not let the
+      // same-message tools run against an uncommitted transaction.
+      ctx.logger.warn('[b2f] settlement rejected while gating tools: %s', error instanceof Error ? error.message : String(error))
+      return {
+        kind: 'deny',
+        reason: '[b2f] file transaction failed unexpectedly; see the [b2f] feedback before retrying.',
+      }
+    }
     if (!report.ok) {
       return {
         kind: 'deny',
