@@ -311,7 +311,7 @@ export interface StepB2FState {
 /** Hints injected into validation and precondition failures. */
 export const ERROR_HINTS: Record<B2FErrorCode, string> = {
   PATH_REQUIRED: 'add file=<relative-path> to the fenced code block info string',
-  PATH_ABSOLUTE: 'use a path relative to $DSH_B2F_ROOT, e.g. file=src/app.py',
+  PATH_ABSOLUTE: 'use a path that resolves inside $DSH_B2F_ROOT, e.g. file=src/app.py',
   PATH_ESCAPE: 'use a relative path inside $DSH_B2F_ROOT; `.` and `..` path segments are rejected',
   MIXED_ROOT_SCOPE: 'split paths from different workspace scopes into separate assistant messages',
   SANDBOX_DENIED: 'change the Session sandbox mode through the approved sandbox flow, then retry in a new message',

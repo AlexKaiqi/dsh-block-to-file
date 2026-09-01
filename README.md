@@ -23,6 +23,10 @@ Attributes: `file` (required), `mode=write|create|update|append|delete` (default
 `write`), plus one edit mode (below); `diff=full|limited|stats|none` (default
 `limited`), `encoding=utf-8`, `newline=preserve|lf|crlf`.
 
+An absolute `file=` path is accepted when it resolves inside the transaction
+root and is rewritten to its relative form; a path that escapes the root is
+rejected with `PATH_ABSOLUTE`.
+
 `append` is computed from the observed blob and is idempotent: when that blob
 already ends with the block content, b2f reports `[b2f] append skipped`.
 

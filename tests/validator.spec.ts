@@ -45,6 +45,24 @@ describe('validateFileBlocks', () => {
     expect(validate('```python file=a/../../b.py\nx\n```\n', root).errors[0]!.code).toBe('PATH_ESCAPE')
   })
 
+  it('accepts an absolute path that resolves inside the root', () => {
+    const root = makeRoot()
+    const inside = validate('```python file=' + root + '/src/app.py\nx\n```\n', root)
+    expect(inside.valid).toBe(true)
+    expect(inside.validated[0]!.normalizedPath).toBe('src/app.py')
+    expect(inside.validated[0]!.targetPath).toBe(join(root, 'src/app.py'))
+
+    const dots = validate('```python file=' + root + '/src/../lib/a.py\nx\n```\n', root)
+    expect(dots.valid).toBe(true)
+    expect(dots.validated[0]!.normalizedPath).toBe('lib/a.py')
+  })
+
+  it('rejects absolute paths that escape the root', () => {
+    const root = makeRoot()
+    expect(validate('```python file=/etc/passwd\nx\n```\n', root).errors[0]!.code).toBe('PATH_ABSOLUTE')
+    expect(validate('```python file=' + root + '/../sibling.py\nx\n```\n', root).errors[0]!.code).toBe('PATH_ABSOLUTE')
+  })
+
   it('rejects duplicate paths in one message', () => {
     const root = makeRoot()
     const result = validate('```python file=src/app.py\na\n```\n```python file=src/app.py\nb\n```\n', root)

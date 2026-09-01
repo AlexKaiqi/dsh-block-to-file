@@ -90,7 +90,12 @@ function makePlainRoot(): string {
   return root
 }
 
-function makeAgent(ctx: Context, id: string, root: string, inject: (message: UserMessage) => void): Agent {
+function makeAgent(
+  ctx: Context,
+  id: string,
+  root: string,
+  delivered: (message: UserMessage) => void,
+): Agent {
   const session = ctx.sessions.create(SessionId(id), { meta: { cwd: root } })
   const agent: Agent = {
     id: SessionId(id),
@@ -101,8 +106,11 @@ function makeAgent(ctx: Context, id: string, root: string, inject: (message: Use
     ctx: ctx.plugin(() => {}).ctx,
     send: () => {},
     followup: () => {},
-    steer: () => {},
-    inject,
+    // b2f delivers model-facing feedback via `steer` (wakes an idle driver so
+    // the `[b2f]` confirmation cannot park forever and stall the loop). Capture
+    // on the delivery channel the plugin actually uses.
+    steer: delivered,
+    inject: () => {},
     cancel() {},
     runMaintenance: task => task(new AbortController().signal),
     whenIdle: () => Promise.resolve(),
@@ -181,6 +189,23 @@ describe('block-to-file plugin', () => {
     expect(existsSync(join(resolveGitDir(root), 'HEAD'))).toBe(true)
   })
 
+  it('accepts an absolute file= path inside the root and rejects one outside', async () => {
+    const root = makeRoot()
+    const ctx = await setup(root)
+    const injected: UserMessage[] = []
+    const agent = makeAgent(ctx, 'b2f-absolute-path', root, message => injected.push(message))
+
+    appendAssistant(agent, 'msg-absolute-inside', '```text file=' + root + '/inside.txt\nabsolute\n```\n')
+    await Promise.resolve()
+    expect(readFileSync(join(root, 'inside.txt'), 'utf8')).toBe('absolute\n')
+
+    appendAssistant(agent, 'msg-absolute-outside', '```text file=/etc/b2f-should-not-write.txt\nescaped\n```\n', 2)
+    await Promise.resolve()
+    expect(existsSync('/etc/b2f-should-not-write.txt')).toBe(false)
+    expect(injected).toHaveLength(2)
+    expect(feedbackText(injected[1]!)).toContain('PATH_ABSOLUTE')
+  })
+
   it('materializes file blocks when an assistant message is appended', async () => {
     const root = makeRoot()
     const ctx = await setup(root)
@@ -202,6 +227,35 @@ describe('block-to-file plugin', () => {
     expect(readFileSync(join(root, 'src/app.py'), 'utf8')).toBe('print("hello")\n')
     expect(injected).toHaveLength(1)
     expect(injected[0]!.content).toEqual([{ type: 'text', text: expect.stringContaining('[b2f] created src/app.py') }])
+  })
+
+  // Regression: a pure-file transaction (no tool calls in the message) must not
+  // park the `[b2f]` feedback forever. The delivery must wake an idle driver
+  // (`steer`), never queue silently for a future pre-step (`inject`), which in
+  // dsh-agent parks model-facing context when the driver goes idle and can
+  // stall the loop waiting on a commit confirmation.
+  it('delivers b2f feedback after a pure-file transaction without a tool call', async () => {
+    const root = makeRoot()
+    const ctx = await setup(root)
+    const delivered: UserMessage[] = []
+    const agent = makeAgent(ctx, 'b2f-plugin-idle-feedback', root, m => delivered.push(m))
+
+    agent.session.append('assistant/message', {
+      turn: 1,
+      step: 1,
+      message: {
+        id: MessageId('msg-idle-feedback'),
+        role: 'assistant',
+        content: [textBlock('```text file=idle.txt\npayload\n```\n')],
+        source: { kind: 'model', provider: 'test', model: 'test' },
+      },
+    }, { surfaceOp: 'append' })
+    await Promise.resolve()
+
+    expect(readFileSync(join(root, 'idle.txt'), 'utf8')).toBe('payload\n')
+    // The settlement's feedback reaches the model on the wake-capable channel.
+    expect(delivered).toHaveLength(1)
+    expect(delivered[0]!.content).toEqual([{ type: 'text', text: expect.stringContaining('[b2f] created idle.txt') }])
   })
 
   it('does not absorb a following text content block into a file fence', async () => {

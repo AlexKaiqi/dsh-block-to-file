@@ -60,7 +60,7 @@ export function validateFileBlocks(
 
   const normalized: { block: FileBlock; normalizedPath: string; targetPath: string }[] = []
   for (const block of blocks) {
-    const normalizedPath = normalizePath(block.path, errors)
+    const normalizedPath = normalizePath(block.path, config.root, errors)
     if (normalizedPath === null) continue
     const targetPath = posix.join(config.root, normalizedPath)
     normalized.push({ block, normalizedPath, targetPath })
@@ -182,9 +182,15 @@ export function validateFileBlocks(
 
 /**
  * Lexically normalize and sandbox one `file=` path.
+ *
+ * The sandbox is containment, not spelling: an absolute path that resolves
+ * inside the transaction root denotes the same file as its relative form and
+ * is rewritten to that form. Interior `..` segments are resolved lexically
+ * before the containment check. Absolute paths that escape the root, and
+ * Windows drive-letter paths, are still rejected with `PATH_ABSOLUTE`.
  * @returns the POSIX-normalized relative path, or null when the path is rejected.
  */
-function normalizePath(rawPath: string, errors: B2FError[]): string | null {
+function normalizePath(rawPath: string, root: string, errors: B2FError[]): string | null {
   if (rawPath.length === 0) {
     errors.push({ code: 'PATH_REQUIRED', path: rawPath, hint: ERROR_HINTS.PATH_REQUIRED })
     return null
@@ -195,14 +201,20 @@ function normalizePath(rawPath: string, errors: B2FError[]): string | null {
   }
 
   const slashed = rawPath.replaceAll('\\', '/')
+  const pushAbsolute = (): null => {
+    errors.push({ code: 'PATH_ABSOLUTE', path: rawPath, hint: ERROR_HINTS.PATH_ABSOLUTE })
+    return null
+  }
   if (slashed.startsWith('/')) {
-    errors.push({ code: 'PATH_ABSOLUTE', path: rawPath, hint: ERROR_HINTS.PATH_ABSOLUTE })
-    return null
+    // Containment against the transaction root, lexically: `..` segments that
+    // stay inside the root normalize away, anything escaping is rejected.
+    const stripped = posix.normalize(slashed).replace(/\/+$/, '')
+    const rootNorm = root.replaceAll('\\', '/').replace(/\/+$/, '') || '/'
+    const relativeToRoot = stripped.length === 0 ? '..' : posix.relative(rootNorm, stripped)
+    if (relativeToRoot === '' || relativeToRoot === '..' || relativeToRoot.startsWith('../')) return pushAbsolute()
+    return relativeToRoot
   }
-  if (/^[A-Za-z]:/.test(slashed)) {
-    errors.push({ code: 'PATH_ABSOLUTE', path: rawPath, hint: ERROR_HINTS.PATH_ABSOLUTE })
-    return null
-  }
+  if (/^[A-Za-z]:/.test(slashed)) return pushAbsolute()
 
   const segments = slashed.split('/')
   if (segments.some(segment => segment === '.' || segment === '..')) {

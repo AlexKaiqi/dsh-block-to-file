@@ -466,10 +466,20 @@ function callKey(sessionId: string, callId: string): string {
   return `${sessionId}:${callId}`
 }
 
-/** Inject `[b2f]` feedback into the next step without waking an idle driver. */
+/**
+ * Deliver `[b2f]` feedback to the model at the nearest step boundary.
+ *
+ * Uses `agent.steer` rather than `agent.inject`: `inject` queues model-facing
+ * context for the next pre-step **without waking an idle driver** and may miss
+ * a request whose pre-step already claimed its batch (see `Agent.inject` in
+ * dsh-agent). When a pure-file transaction leaves the driver idle, that would
+ * park the `[b2f]` confirmation forever and the model would stall waiting on it
+ * — directly interrupting the agent loop. `steer` wakes an idle driver and is
+ * consumed at the next step boundary, so the feedback always reaches the model.
+ */
 function injectFeedback(agent: Agent, feedback: string): void {
   try {
-    agent.inject(createUserMessage({
+    agent.steer(createUserMessage({
       source: { kind: 'plugin', plugin: 'b2f', form: 'notice', summary: feedback.split('\n')[0] ?? 'b2f feedback' },
       content: [{ type: 'text', text: feedback }],
     }))
